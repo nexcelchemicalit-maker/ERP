@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Nexcel ERP — Inventory</title>
+<style>
+  :root {
+    --bg: #f6f7f5; --surface: #ffffff; --line: #e3e5df; --line-strong: #cfd2c9;
+    --text: #1e2420; --muted: #5f6660; --accent: #0f6e56; --accent-soft: #e1f5ee;
+    --warn: #854f0b; --warn-soft: #faeeda; --danger: #a32d2d; --danger-soft: #fcebeb;
+    --ok: #3b6d11; --ok-soft: #eaf3de; --radius: 10px;
+    --font: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14171a; --surface: #1c2024; --line: #2b3036; --line-strong: #3a4048;
+      --text: #e7eae6; --muted: #9aa39c; --accent: #5dcaa5; --accent-soft: #0f3d31;
+      --warn: #fac775; --warn-soft: #402d0a; --danger: #f09595; --danger-soft: #3d1414;
+      --ok: #97c459; --ok-soft: #21340a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--font); font-size: 14px; line-height: 1.5; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding-block: 20px; padding-inline: 16px; }
+  header.top { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
+  header.top h1 { font-size: 20px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+  header.top .sub { color: var(--muted); font-size: 13px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); display: inline-block; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 18px 0; }
+  .tile { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; }
+  .tile .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .tile .v { font-size: 26px; font-weight: 600; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .tile .v small { font-size: 13px; font-weight: 400; color: var(--muted); }
+  nav.tabs { display: flex; gap: 4px; flex-wrap: wrap; border-bottom: 1px solid var(--line); margin: 20px 0 0; }
+  nav.tabs button { background: none; border: none; padding: 9px 14px; font: inherit; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; }
+  nav.tabs button.active { color: var(--text); border-bottom-color: var(--accent); font-weight: 500; }
+  section.panel { display: none; padding-top: 16px; }
+  section.panel.active { display: block; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+  .card + .card { margin-top: 16px; }
+  .card h2 { font-size: 14px; margin: 0; padding: 12px 16px; border-bottom: 1px solid var(--line); font-weight: 600; }
+  .tblwrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 9px 16px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+  tr:last-child td { border-bottom: none; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 20px; font-size: 12px; font-weight: 500; }
+  .pill.released { background: var(--ok-soft); color: var(--ok); }
+  .pill.quarantine { background: var(--warn-soft); color: var(--warn); }
+  .pill.rejected, .pill.scrapped { background: var(--danger-soft); color: var(--danger); }
+  .pill.rework, .pill.pending { background: var(--accent-soft); color: var(--accent); }
+  form.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; padding: 16px; }
+  label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+  input, select { font: inherit; font-size: 14px; padding: 8px 10px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--text); }
+  .actions { padding: 0 16px 16px; display: flex; gap: 10px; align-items: center; }
+  button.go { background: var(--accent); color: #fff; border: none; padding: 9px 18px; border-radius: 8px; font: inherit; font-weight: 500; cursor: pointer; }
+  button.mini { background: none; border: 1px solid var(--line-strong); color: var(--text); padding: 4px 10px; border-radius: 6px; cursor: pointer; font-size: 12px; }
+  .msg { font-size: 13px; }
+  .msg.err { color: var(--danger); } .msg.ok { color: var(--ok); }
+  .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <h1>Nexcel ERP</h1>
+    <span class="sub"><span class="dot"></span> Inventory &amp; Traceability · Phase 1</span>
+    <span class="sub" style="margin-left:auto" id="clock"></span>
+  </header>
+
+  <div class="tiles" id="tiles"></div>
+
+  <nav class="tabs" id="tabs">
+    <button data-tab="stock" class="active">Stock on hand</button>
+    <button data-tab="lots">Lots</button>
+    <button data-tab="movements">Movements</button>
+    <button data-tab="items">Items</button>
+    <button data-tab="receive">Receive goods</button>
+  </nav>
+
+  <section class="panel active" id="panel-stock">
+    <div class="card"><h2>Stock — lot × bin × uom</h2><div class="tblwrap"><table id="tbl-stock"></table></div></div>
+  </section>
+
+  <section class="panel" id="panel-lots">
+    <div class="card"><h2>Lots (click Release / Reject to set QC status)</h2><div class="tblwrap"><table id="tbl-lots"></table></div></div>
+  </section>
+
+  <section class="panel" id="panel-movements">
+    <div class="card"><h2>Movement ledger (latest 50)</h2><div class="tblwrap"><table id="tbl-moves"></table></div></div>
+  </section>
+
+  <section class="panel" id="panel-items">
+    <div class="card"><h2>Item master</h2><div class="tblwrap"><table id="tbl-items"></table></div></div>
+  </section>
+
+  <section class="panel" id="panel-receive">
+    <div class="card">
+      <h2>Goods receipt — creates a lot in quarantine</h2>
+      <form class="grid" id="form-receipt">
+        <label>Item
+          <select name="item_id" id="rcv-item" required></select>
+        </label>
+        <label>Lot number
+          <input name="lot_no" placeholder="e.g. IPA-2609-02" required />
+        </label>
+        <label>Supplier lot no
+          <input name="supplier_lot_no" placeholder="optional" />
+        </label>
+        <label>Quantity
+          <input name="qty" type="number" step="any" min="0" required />
+        </label>
+        <label>UOM
+          <select name="uom_id" id="rcv-uom" required></select>
+        </label>
+        <label>Bin
+          <select name="bin_id" id="rcv-bin"></select>
+        </label>
+        <label>Expiry date
+          <input name="expiry_date" type="date" />
+        </label>
+      </form>
+      <div class="actions">
+        <button class="go" id="rcv-go">Receive</button>
+        <span class="msg" id="rcv-msg"></span>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+const $ = (s, r=document) => r.querySelector(s);
+const api = (p, o) => fetch('/api' + p, o).then(async r => { const j = await r.json().catch(()=>({})); if(!r.ok) throw new Error(j.error||('HTTP '+r.status)); return j; });
+const esc = s => (s==null?'':String(s)).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const pill = s => `<span class="pill ${esc(s)}">${esc(s)}</span>`;
+const money = n => '₹' + (Number(n)||0).toLocaleString('en-IN', {maximumFractionDigits:0});
+
+$('#clock').textContent = new Date().toLocaleString('en-IN', {dateStyle:'medium', timeStyle:'short'});
+
+function table(el, cols, rows, rowExtra){
+  const head = '<thead><tr>' + cols.map(c=>`<th class="${c.num?'num':''}">${c.label}</th>`).join('') + (rowExtra?'<th></th>':'') + '</tr></thead>';
+  const body = '<tbody>' + (rows.length? rows.map(r=>'<tr>' + cols.map(c=>{
+      const v = c.render? c.render(r[c.key], r) : esc(r[c.key]);
+      return `<td class="${c.num?'num':''}">${v==null?'':v}</td>`;
+    }).join('') + (rowExtra?('<td>'+rowExtra(r)+'</td>'):'') + '</tr>').join('')
+    : `<tr><td colspan="${cols.length+(rowExtra?1:0)}" class="muted" style="padding:18px 16px">No rows yet.</td></tr>`) + '</tbody>';
+  el.innerHTML = head + body;
+}
+
+async function loadTiles(){
+  const s = await api('/dashboard/summary');
+  const t = s.tiles;
+  const cells = [
+    ['Items', t.items], ['Lots', t.lots],
+    ['Released', t.released], ['In quarantine', t.quarantine],
+    ['Stock lines', t.stockLines], ['Approx. value', money(s.approxStockValue), true],
+  ];
+  $('#tiles').innerHTML = cells.map(([k,v])=>`<div class="tile"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+}
+
+async function loadStock(){
+  const rows = await api('/stock');
+  table($('#tbl-stock'), [
+    {key:'item_name', label:'Item'},
+    {key:'lot_no', label:'Lot'},
+    {key:'qc_status', label:'QC', render:pill},
+    {key:'bin_code', label:'Bin'},
+    {key:'qty_on_hand', label:'On hand', num:true},
+    {key:'qty_reserved', label:'Reserved', num:true},
+    {key:'qty_available', label:'Available', num:true},
+    {key:'uom', label:'UOM'},
+    {key:'expiry_date', label:'Expiry'},
+  ], rows);
+}
+
+async function loadLots(){
+  const rows = await api('/lots');
+  table($('#tbl-lots'), [
+    {key:'item_name', label:'Item'},
+    {key:'lot_no', label:'Lot'},
+    {key:'supplier_lot_no', label:'Supplier lot'},
+    {key:'qc_status', label:'QC', render:pill},
+    {key:'qty_on_hand', label:'Qty', num:true},
+    {key:'expiry_date', label:'Expiry'},
+  ], rows, r => r.qc_status==='quarantine'
+      ? `<button class="mini" data-rel="${r.id}">Release</button> <button class="mini" data-rej="${r.id}">Reject</button>`
+      : '<span class="muted">—</span>');
+}
+
+async function loadMoves(){
+  const rows = await api('/movements');
+  table($('#tbl-moves'), [
+    {key:'performed_at', label:'When'},
+    {key:'movement_type', label:'Type'},
+    {key:'item_name', label:'Item'},
+    {key:'lot_no', label:'Lot'},
+    {key:'qty', label:'Qty', num:true},
+    {key:'uom', label:'UOM'},
+    {key:'from_bin', label:'From'},
+    {key:'to_bin', label:'To'},
+    {key:'reason_code', label:'Reason'},
+  ], rows);
+}
+
+async function loadItems(){
+  const rows = await api('/items');
+  table($('#tbl-items'), [
+    {key:'code', label:'Code'},
+    {key:'name', label:'Name'},
+    {key:'item_type', label:'Type'},
+    {key:'base_uom', label:'Base UOM'},
+    {key:'hazard_class', label:'Hazard'},
+    {key:'standard_cost', label:'Std cost', num:true, render:v=>money(v)},
+  ], rows);
+}
+
+async function loadReceiveForm(){
+  const [items, uoms, bins] = await Promise.all([api('/items'), api('/uoms'), api('/bins')]);
+  $('#rcv-item').innerHTML = items.map(i=>`<option value="${i.id}">${esc(i.code)} — ${esc(i.name)}</option>`).join('');
+  $('#rcv-uom').innerHTML = uoms.map(u=>`<option value="${u.id}">${esc(u.code)}</option>`).join('');
+  $('#rcv-bin').innerHTML = '<option value="">(auto: quarantine)</option>' + bins.map(b=>`<option value="${b.id}">${esc(b.code)} — ${esc(b.zone||'')}</option>`).join('');
+}
+
+// Tabs
+const loaders = { stock: loadStock, lots: loadLots, movements: loadMoves, items: loadItems, receive: loadReceiveForm };
+$('#tabs').addEventListener('click', e => {
+  const b = e.target.closest('button[data-tab]'); if(!b) return;
+  document.querySelectorAll('#tabs button').forEach(x=>x.classList.toggle('active', x===b));
+  const tab = b.dataset.tab;
+  document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active', p.id==='panel-'+tab));
+  loaders[tab]();
+});
+
+// Lot release/reject
+$('#tbl-lots').addEventListener('click', async e => {
+  const rel = e.target.dataset.rel, rej = e.target.dataset.rej;
+  const id = rel || rej; if(!id) return;
+  try {
+    await api(`/lots/${id}/qc`, {method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({ decision: rel?'released':'rejected', reason_code: rej?'supplier_quality':null, decided_by:'usr-qc' })});
+    await Promise.all([loadTiles(), loadLots()]);
+  } catch(err){ alert(err.message); }
+});
+
+// Receipt submit
+$('#rcv-go').addEventListener('click', async () => {
+  const f = $('#form-receipt'); const msg = $('#rcv-msg'); msg.className='msg';
+  const data = Object.fromEntries(new FormData(f).entries());
+  if(!data.item_id || !data.lot_no || !data.qty || !data.uom_id){ msg.textContent='Fill item, lot, qty and UOM.'; msg.className='msg err'; return; }
+  if(!data.bin_id) delete data.bin_id;
+  data.performed_by = 'usr-admin';
+  try {
+    const r = await api('/receipts', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(data)});
+    msg.textContent = `Received. Lot created in quarantine (${r.lot_id.slice(0,8)}…).`; msg.className='msg ok';
+    f.reset();
+    await Promise.all([loadTiles(), loadStock(), loadLots(), loadMoves()]);
+  } catch(err){ msg.textContent = err.message; msg.className='msg err'; }
+});
+
+// Boot
+loadTiles().catch(e=>console.error(e));
+loadStock().catch(e=>console.error(e));
+</script>
+</body>
+</html>

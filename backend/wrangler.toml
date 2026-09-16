@@ -1,0 +1,21 @@
+name = "nexcel-erp"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Serves the dashboard (public/) as static assets; anything that isn't a static
+# file falls through to the Worker (the /api/* routes).
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "nexcel-erp-db"
+# Local dev works without this. Fill it in after `wrangler d1 create nexcel-erp-db`
+# to deploy to your Cloudflare account.
+database_id = "REPLACE_WITH_DATABASE_ID_FROM_wrangler_d1_create"
+migrations_dir = "migrations"
+
+[observability]
+enabled = true
