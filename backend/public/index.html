@@ -76,6 +76,7 @@
   <nav class="tabs" id="tabs">
     <button data-tab="stock" class="active">Stock on hand</button>
     <button data-tab="lots">Lots</button>
+    <button data-tab="formulas">Formulas</button>
     <button data-tab="qc">Quality (QC)</button>
     <button data-tab="specs">Specifications</button>
     <button data-tab="coas">COAs</button>
@@ -90,6 +91,11 @@
 
   <section class="panel" id="panel-lots">
     <div class="card"><h2>Lots (click Release / Reject to set QC status)</h2><div class="tblwrap"><table id="tbl-lots"></table></div></div>
+  </section>
+
+  <section class="panel" id="panel-formulas">
+    <div class="card"><h2>Formulas (Master Batch Records)</h2><div class="tblwrap"><table id="tbl-formulas"></table></div></div>
+    <div class="card" id="formula-detail" hidden></div>
   </section>
 
   <section class="panel" id="panel-qc">
@@ -263,6 +269,42 @@ async function loadReceiveForm(){
   $('#rcv-bin').innerHTML = '<option value="">(auto: quarantine)</option>' + bins.map(b=>`<option value="${b.id}">${esc(b.code)} — ${esc(b.zone||'')}</option>`).join('');
 }
 
+// ---------- Formulas ----------
+async function loadFormulas(){
+  const rows = await api('/formulas');
+  table($('#tbl-formulas'), [
+    {key:'product_name', label:'Product'},
+    {key:'version', label:'Ver', num:true},
+    {key:'status', label:'Status', render:pill},
+    {key:'base_qty', label:'Base', num:true, render:(v,r)=>esc(v)+' '+esc(r.base_uom)},
+    {key:'security_level', label:'Security'},
+    {key:'material_cost', label:'Material', num:true, render:v=>money(v)},
+    {key:'packaging_cost', label:'Packaging', num:true, render:v=>money(v)},
+    {key:'total_cost', label:'Total', num:true, render:v=>money(v)},
+  ], rows, r => `<button class="mini" data-formula="${r.id}">View</button>`);
+}
+
+async function openFormula(id){
+  const f = await api('/formulas/'+id);
+  const ing = f.ingredients.map(r=>`<tr><td>${esc(r.sequence)}</td><td>${esc(r.item_name)} <span class="muted">${esc(r.item_code)}</span></td><td class="num">${esc(r.qty)} ${esc(r.uom)}</td><td class="num">${r.percentage!=null?esc(r.percentage)+'%':''}</td><td class="num">${money(r.line_cost)}</td></tr>`).join('');
+  const steps = f.steps.map(s=>{
+    const tgt = s.param_type ? `${esc(s.param_type)}${s.target!=null?(' '+esc(s.target)):''}${(s.tolerance_low!=null||s.tolerance_high!=null)?(' ('+[s.tolerance_low,s.tolerance_high].filter(x=>x!=null).join('–')+')'):''}` : '';
+    const ipc = Number(s.is_ipc_checkpoint) ? ' '+pill('quarantine').replace('quarantine','IPC') : '';
+    return `<tr><td>${esc(s.step_no)}</td><td>${esc(s.instruction)}${ipc}</td><td>${tgt}</td></tr>`;
+  }).join('');
+  const pkg = f.packaging.map(p=>`<tr><td>${esc(p.item_name)} <span class="muted">${esc(p.item_code)}</span></td><td class="num">${esc(p.qty_per_base)} ${esc(p.uom)}</td><td class="num">${money(p.line_cost)}</td></tr>`).join('');
+  const approveBtn = f.status==='draft' ? `<button class="go" data-approve="${f.id}">Approve formula</button>` : '';
+  $('#formula-detail').hidden = false;
+  $('#formula-detail').innerHTML = `
+    <h2>${esc(f.product_name)} — v${f.version} ${pill(f.status)} · base ${esc(f.base_qty)} ${esc(f.base_uom)}</h2>
+    <div style="padding:0 16px 6px" class="muted">Security: ${esc(f.security_level)} · Material ${money(f.costs.material_cost)} + Packaging ${money(f.costs.packaging_cost)} = <strong>${money(f.costs.total_cost)}</strong> per base batch</div>
+    <div class="tblwrap"><table><thead><tr><th>Seq</th><th>Ingredient</th><th class="num">Qty</th><th class="num">%</th><th class="num">Cost</th></tr></thead><tbody>${ing}</tbody></table></div>
+    <div class="tblwrap" style="margin-top:8px"><table><thead><tr><th>Step</th><th>Instruction</th><th>Parameter</th></tr></thead><tbody>${steps}</tbody></table></div>
+    <div class="tblwrap" style="margin-top:8px"><table><thead><tr><th>Packaging</th><th class="num">Per base</th><th class="num">Cost</th></tr></thead><tbody>${pkg||'<tr><td colspan="3" class="muted">None</td></tr>'}</tbody></table></div>
+    <div class="actions">${approveBtn}<span class="msg" id="fd-msg"></span></div>`;
+  $('#formula-detail').scrollIntoView({behavior:'smooth', block:'nearest'});
+}
+
 // ---------- Quality (QC) ----------
 async function loadQc(){
   const [lots, samples] = await Promise.all([api('/lots'), api('/samples')]);
@@ -376,7 +418,7 @@ async function openCoa(id){
 }
 
 // Tabs
-const loaders = { stock: loadStock, lots: loadLots, qc: loadQc, specs: loadSpecs, coas: loadCoas, movements: loadMoves, items: loadItems, receive: loadReceiveForm };
+const loaders = { stock: loadStock, lots: loadLots, formulas: loadFormulas, qc: loadQc, specs: loadSpecs, coas: loadCoas, movements: loadMoves, items: loadItems, receive: loadReceiveForm };
 $('#tabs').addEventListener('click', e => {
   const b = e.target.closest('button[data-tab]'); if(!b) return;
   document.querySelectorAll('#tabs button').forEach(x=>x.classList.toggle('active', x===b));
@@ -435,6 +477,14 @@ $('#sample-detail').addEventListener('click', e => {
   else if(e.target.id==='disp-release') dispose(sid,'released').catch(err=>alert(err.message));
   else if(e.target.id==='disp-reject') dispose(sid,'rejected').catch(err=>alert(err.message));
   else if(e.target.dataset.coa) openCoa(e.target.dataset.coa).catch(err=>alert(err.message));
+});
+
+// Formulas: view + approve
+$('#tbl-formulas').addEventListener('click', e => { const id=e.target.dataset.formula; if(id) openFormula(id).catch(err=>alert(err.message)); });
+$('#formula-detail').addEventListener('click', async e => {
+  const id = e.target.dataset.approve; if(!id) return;
+  try { await api(`/formulas/${id}/approve`, {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({approved_by:'usr-admin'})}); await loadFormulas(); await openFormula(id); }
+  catch(err){ const m=$('#fd-msg'); if(m){m.textContent=err.message; m.className='msg err';} }
 });
 
 // Specs: view parameters

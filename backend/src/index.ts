@@ -573,6 +573,129 @@ app.get('/api/coas/:id', async (c) => {
   return c.json({ ...co, lines });
 });
 
+// ================= Phase 3: R&D / Formulation =================
+
+async function formulaCosts(db: D1Database, formulaId: string) {
+  const mat = await db
+    .prepare(`SELECT COALESCE(SUM(fi.qty * i.standard_cost),0) c FROM formula_ingredient fi JOIN item i ON i.id=fi.item_id WHERE fi.formula_id=?`)
+    .bind(formulaId)
+    .first<{ c: number }>();
+  const pkg = await db
+    .prepare(`SELECT COALESCE(SUM(p.qty_per_base * i.standard_cost),0) c FROM packaging_spec p JOIN item i ON i.id=p.packaging_item_id WHERE p.formula_id=?`)
+    .bind(formulaId)
+    .first<{ c: number }>();
+  const material = mat?.c ?? 0;
+  const packaging = pkg?.c ?? 0;
+  return { material_cost: material, packaging_cost: packaging, total_cost: material + packaging };
+}
+
+app.get('/api/formulas', async (c) => {
+  const rows = (await c.env.DB.prepare(
+    `SELECT f.id, f.version, f.status, f.base_qty, f.security_level,
+            i.code product_code, i.name product_name, u.code base_uom
+     FROM formula f JOIN item i ON i.id=f.product_item_id JOIN uom u ON u.id=f.base_uom_id
+     ORDER BY i.name, f.version`,
+  ).all()).results as Array<any>;
+  for (const r of rows) Object.assign(r, await formulaCosts(c.env.DB, r.id));
+  return c.json(rows);
+});
+
+app.get('/api/formulas/:id', async (c) => {
+  const id = c.req.param('id');
+  const db = c.env.DB;
+  const f = await db
+    .prepare(`SELECT f.*, i.code product_code, i.name product_name, u.code base_uom FROM formula f JOIN item i ON i.id=f.product_item_id JOIN uom u ON u.id=f.base_uom_id WHERE f.id=?`)
+    .bind(id)
+    .first();
+  if (!f) return c.json({ error: 'formula not found' }, 404);
+  const ingredients = (await db
+    .prepare(
+      `SELECT fi.id, fi.sequence, fi.qty, fi.percentage, fi.is_optional, i.code item_code, i.name item_name,
+              u.code uom, i.standard_cost, (fi.qty * i.standard_cost) line_cost
+       FROM formula_ingredient fi JOIN item i ON i.id=fi.item_id JOIN uom u ON u.id=fi.uom_id
+       WHERE fi.formula_id=? ORDER BY fi.sequence`,
+    )
+    .bind(id)
+    .all()).results;
+  const steps = (await db
+    .prepare(`SELECT id, step_no, instruction, param_type, target, tolerance_low, tolerance_high, is_ipc_checkpoint FROM formula_step WHERE formula_id=? ORDER BY step_no`)
+    .bind(id)
+    .all()).results;
+  const packaging = (await db
+    .prepare(`SELECT p.id, p.qty_per_base, i.code item_code, i.name item_name, u.code uom, i.standard_cost, (p.qty_per_base*i.standard_cost) line_cost FROM packaging_spec p JOIN item i ON i.id=p.packaging_item_id JOIN uom u ON u.id=p.uom_id WHERE p.formula_id=?`)
+    .bind(id)
+    .all()).results;
+  return c.json({ ...f, ingredients, steps, packaging, costs: await formulaCosts(db, id) });
+});
+
+app.post('/api/formulas', async (c) => {
+  const b = await c.req.json();
+  if (!b.product_item_id || !b.base_qty || !b.base_uom_id)
+    return c.json({ error: 'product_item_id, base_qty and base_uom_id are required' }, 400);
+  const id = uid();
+  const ver = b.version ?? 1;
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO formula (id,product_item_id,version,status,base_qty,base_uom_id,security_level) VALUES (?,?,?, 'draft', ?,?,?)`,
+    )
+      .bind(id, b.product_item_id, ver, b.base_qty, b.base_uom_id, b.security_level ?? 'open')
+      .run();
+  } catch (e) {
+    return c.json({ error: 'could not create formula (version already exists for this product?)', detail: String(e) }, 400);
+  }
+  return c.json({ id }, 201);
+});
+
+app.post('/api/formulas/:id/ingredients', async (c) => {
+  const fid = c.req.param('id');
+  const b = await c.req.json();
+  if (!b.item_id || b.qty === undefined || !b.uom_id) return c.json({ error: 'item_id, qty and uom_id are required' }, 400);
+  const id = uid();
+  await c.env.DB.prepare(
+    `INSERT INTO formula_ingredient (id,formula_id,item_id,sequence,qty,uom_id,percentage,substitute_group,is_optional) VALUES (?,?,?,?,?,?,?,?,?)`,
+  )
+    .bind(id, fid, b.item_id, b.sequence ?? 1, b.qty, b.uom_id, b.percentage ?? null, b.substitute_group ?? null, b.is_optional ? 1 : 0)
+    .run();
+  return c.json({ id }, 201);
+});
+
+app.post('/api/formulas/:id/steps', async (c) => {
+  const fid = c.req.param('id');
+  const b = await c.req.json();
+  if (!b.step_no || !b.instruction) return c.json({ error: 'step_no and instruction are required' }, 400);
+  const id = uid();
+  await c.env.DB.prepare(
+    `INSERT INTO formula_step (id,formula_id,step_no,instruction,param_type,target,tolerance_low,tolerance_high,is_ipc_checkpoint,ipc_spec_parameter_id)
+     VALUES (?,?,?,?,?,?,?,?,?,?)`,
+  )
+    .bind(id, fid, b.step_no, b.instruction, b.param_type ?? null, b.target ?? null, b.tolerance_low ?? null, b.tolerance_high ?? null, b.is_ipc_checkpoint ? 1 : 0, b.ipc_spec_parameter_id ?? null)
+    .run();
+  return c.json({ id }, 201);
+});
+
+app.post('/api/formulas/:id/packaging', async (c) => {
+  const fid = c.req.param('id');
+  const b = await c.req.json();
+  if (!b.packaging_item_id || b.qty_per_base === undefined || !b.uom_id) return c.json({ error: 'packaging_item_id, qty_per_base and uom_id are required' }, 400);
+  const id = uid();
+  await c.env.DB.prepare(`INSERT INTO packaging_spec (id,formula_id,packaging_item_id,qty_per_base,uom_id) VALUES (?,?,?,?,?)`)
+    .bind(id, fid, b.packaging_item_id, b.qty_per_base, b.uom_id)
+    .run();
+  return c.json({ id }, 201);
+});
+
+app.post('/api/formulas/:id/approve', async (c) => {
+  const id = c.req.param('id');
+  const b = await c.req.json().catch(() => ({}));
+  const res = await c.env.DB
+    .prepare(`UPDATE formula SET status='approved', approved_by=?, approved_at=datetime('now') WHERE id=? AND status='draft'`)
+    .bind(b.approved_by ?? null, id)
+    .run();
+  if (!res.meta.changes) return c.json({ error: 'formula not found or not in draft' }, 400);
+  await audit(c.env.DB, 'formula', id, 'status_change', { status: 'approved' }, b.approved_by);
+  return c.json({ id, status: 'approved' });
+});
+
 // API 404 fallback (static assets are handled by the [assets] binding).
 app.all('/api/*', (c) => c.json({ error: 'not found' }, 404));
 

@@ -1,5 +1,6 @@
 -- Sample data so the dashboard opens in a realistic state. Example data only.
 
+DELETE FROM packaging_spec; DELETE FROM formula_step; DELETE FROM formula_ingredient; DELETE FROM formula;
 DELETE FROM coa_line; DELETE FROM coa; DELETE FROM qc_disposition; DELETE FROM test_result;
 DELETE FROM sample; DELETE FROM spec_parameter; DELETE FROM specification;
 DELETE FROM count_line; DELETE FROM inventory_count; DELETE FROM reservation;
@@ -30,13 +31,14 @@ INSERT INTO item (id,code,name,item_type,base_uom_id,shelf_life_days,hazard_clas
  ('itm-solvent','RM-IPA','Isopropyl alcohol','raw','uom-l',365,'GHS02 Flammable',95.0),
  ('itm-dye','RM-DYE-BLU','Reactive blue dye','raw','uom-kg',540,NULL,310.0),
  ('itm-drum200','PK-DRUM200','HDPE drum 200L','packaging','uom-ea',NULL,NULL,650.0),
+ ('itm-water','RM-WATER','Demineralised water','raw','uom-l',NULL,NULL,2.0),
  ('itm-cleaner','FG-CLEAN-IND','Industrial cleaner concentrate','finished','uom-l',365,'GHS07 Irritant',0);
 
 INSERT INTO item_uom (id,item_id,uom_id) VALUES
  ('iu-1','itm-caustic','uom-kg'),('iu-2','itm-caustic','uom-g'),
  ('iu-3','itm-sulfacid','uom-l'),('iu-4','itm-solvent','uom-l'),
  ('iu-5','itm-dye','uom-kg'),('iu-6','itm-drum200','uom-ea'),
- ('iu-7','itm-cleaner','uom-l'),('iu-8','itm-cleaner','uom-drum');
+ ('iu-7','itm-cleaner','uom-l'),('iu-8','itm-cleaner','uom-drum'),('iu-9','itm-water','uom-l');
 
 -- Partners
 INSERT INTO partner (id,code,name,partner_type,tax_id) VALUES
@@ -106,3 +108,23 @@ INSERT INTO spec_parameter (id,spec_id,sequence,test_name,method,result_type,uom
  -- Finished cleaner
  ('sp-clean-1','spec-cleaner',1,'Active content','Titration','numeric',NULL,28.0,32.0,30.0,NULL),
  ('sp-clean-2','spec-cleaner',2,'pH (1% soln)','pH meter','numeric',NULL,9.0,11.0,10.0,NULL);
+
+-- ---------- Formulation (Phase 3): approved recipe for the finished cleaner ----------
+-- Base batch = 1000 L. Ingredients scale linearly with a production order.
+INSERT INTO formula (id,product_item_id,version,status,base_qty,base_uom_id,security_level,approved_by,approved_at) VALUES
+ ('fm-cleaner','itm-cleaner',1,'approved',1000,'uom-l','restricted','usr-admin','2026-02-01');
+
+INSERT INTO formula_ingredient (id,formula_id,item_id,sequence,qty,uom_id,percentage,substitute_group,is_optional) VALUES
+ ('fi-1','fm-cleaner','itm-water',1,830,'uom-l',83.0,NULL,0),
+ ('fi-2','fm-cleaner','itm-caustic',2,120,'uom-kg',12.0,NULL,0),
+ ('fi-3','fm-cleaner','itm-solvent',3,50,'uom-l',5.0,NULL,0);
+
+INSERT INTO formula_step (id,formula_id,step_no,instruction,param_type,target,tolerance_low,tolerance_high,is_ipc_checkpoint,ipc_spec_parameter_id) VALUES
+ ('fs-1','fm-cleaner',1,'Charge demineralised water to reactor',NULL,NULL,NULL,NULL,0,NULL),
+ ('fs-2','fm-cleaner',2,'Add caustic soda slowly, maintain below 45 C','temp',40,NULL,45,0,NULL),
+ ('fs-3','fm-cleaner',3,'Add isopropyl alcohol and mix',NULL,NULL,NULL,NULL,0,NULL),
+ ('fs-4','fm-cleaner',4,'Mix 30 minutes','time',30,25,40,0,NULL),
+ ('fs-5','fm-cleaner',5,'IPC: check pH of 1% solution','ph',10,9,11,1,'sp-clean-2');
+
+INSERT INTO packaging_spec (id,formula_id,packaging_item_id,qty_per_base,uom_id) VALUES
+ ('pk-1','fm-cleaner','itm-drum200',5,'uom-ea');
