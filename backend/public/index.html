@@ -67,7 +67,7 @@
 <div class="wrap">
   <header class="top">
     <h1>Nexcel ERP</h1>
-    <span class="sub"><span class="dot"></span> Inventory &amp; Traceability · Phase 1</span>
+    <span class="sub"><span class="dot"></span> Inventory · Quality · Phase 2</span>
     <span class="sub" style="margin-left:auto" id="clock"></span>
   </header>
 
@@ -76,6 +76,9 @@
   <nav class="tabs" id="tabs">
     <button data-tab="stock" class="active">Stock on hand</button>
     <button data-tab="lots">Lots</button>
+    <button data-tab="qc">Quality (QC)</button>
+    <button data-tab="specs">Specifications</button>
+    <button data-tab="coas">COAs</button>
     <button data-tab="movements">Movements</button>
     <button data-tab="items">Items</button>
     <button data-tab="receive">Receive goods</button>
@@ -87,6 +90,40 @@
 
   <section class="panel" id="panel-lots">
     <div class="card"><h2>Lots (click Release / Reject to set QC status)</h2><div class="tblwrap"><table id="tbl-lots"></table></div></div>
+  </section>
+
+  <section class="panel" id="panel-qc">
+    <div class="card">
+      <h2>Pull a sample for testing</h2>
+      <form class="grid" id="form-sample">
+        <label>Lot (pending / quarantine)
+          <select name="lot_id" id="qc-lot" required></select>
+        </label>
+        <label>Sample type
+          <select name="sample_type" id="qc-type">
+            <option value="incoming">Incoming</option>
+            <option value="in_process">In-process</option>
+            <option value="finished">Finished</option>
+          </select>
+        </label>
+      </form>
+      <div class="actions">
+        <button class="go" id="qc-pull">Pull sample</button>
+        <span class="msg" id="qc-msg"></span>
+      </div>
+    </div>
+    <div class="card"><h2>Samples</h2><div class="tblwrap"><table id="tbl-samples"></table></div></div>
+    <div class="card" id="sample-detail" hidden></div>
+  </section>
+
+  <section class="panel" id="panel-specs">
+    <div class="card"><h2>Specifications</h2><div class="tblwrap"><table id="tbl-specs"></table></div></div>
+    <div class="card" id="spec-detail" hidden></div>
+  </section>
+
+  <section class="panel" id="panel-coas">
+    <div class="card"><h2>Certificates of Analysis</h2><div class="tblwrap"><table id="tbl-coas"></table></div></div>
+    <div class="card" id="coa-detail" hidden></div>
   </section>
 
   <section class="panel" id="panel-movements">
@@ -153,10 +190,12 @@ function table(el, cols, rows, rowExtra){
 async function loadTiles(){
   const s = await api('/dashboard/summary');
   const t = s.tiles;
+  const q = s.qc || {samplesOpen:0, oosOpen:0, coas:0};
   const cells = [
     ['Items', t.items], ['Lots', t.lots],
     ['Released', t.released], ['In quarantine', t.quarantine],
-    ['Stock lines', t.stockLines], ['Approx. value', money(s.approxStockValue), true],
+    ['QC open', q.samplesOpen], ['OOS', q.oosOpen], ['COAs', q.coas],
+    ['Approx. value', money(s.approxStockValue)],
   ];
   $('#tiles').innerHTML = cells.map(([k,v])=>`<div class="tile"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
 }
@@ -224,8 +263,120 @@ async function loadReceiveForm(){
   $('#rcv-bin').innerHTML = '<option value="">(auto: quarantine)</option>' + bins.map(b=>`<option value="${b.id}">${esc(b.code)} — ${esc(b.zone||'')}</option>`).join('');
 }
 
+// ---------- Quality (QC) ----------
+async function loadQc(){
+  const [lots, samples] = await Promise.all([api('/lots'), api('/samples')]);
+  const testable = lots.filter(l => l.qc_status==='quarantine' || l.qc_status==='pending');
+  $('#qc-lot').innerHTML = testable.length
+    ? testable.map(l=>`<option value="${l.id}">${esc(l.item_name)} — ${esc(l.lot_no)} (${esc(l.qc_status)})</option>`).join('')
+    : '<option value="">No lots awaiting QC</option>';
+  table($('#tbl-samples'), [
+    {key:'pulled_at', label:'Pulled'},
+    {key:'item_name', label:'Item'},
+    {key:'lot_no', label:'Lot'},
+    {key:'sample_type', label:'Type'},
+    {key:'status', label:'Status', render:pill},
+  ], samples, r => `<button class="mini" data-sample="${r.id}">Open</button>`);
+}
+
+async function openSample(id){
+  const s = await api('/samples/'+id);
+  const rows = s.parameters.map(p=>{
+    const spec = p.result_type==='numeric'
+      ? [ (p.lower_limit!=null?('≥'+p.lower_limit):''), (p.upper_limit!=null?('≤'+p.upper_limit):'') ].filter(Boolean).join(' ') + (p.uom?(' '+p.uom):'')
+      : esc(p.identity_criterion||'—');
+    const verdict = p.pass_fail ? pill(p.pass_fail==='pass'?'released':'rejected').replace('released','pass').replace('rejected','fail') : '<span class="muted">—</span>';
+    return `<tr>
+      <td>${esc(p.test_name)}<div class="muted" style="font-size:11px">${esc(p.method||'')}</div></td>
+      <td>${spec}</td>
+      <td><input data-param="${p.spec_parameter_id}" data-type="${p.result_type}" value="${esc(p.result_value||'')}" style="width:130px" placeholder="result" ${s.status==='closed'?'disabled':''}/></td>
+      <td>${verdict}</td>
+    </tr>`;
+  }).join('');
+  const closed = s.status==='closed';
+  const coaBtn = s.coa ? `<button class="mini" data-coa="${s.coa.id}">View COA ${esc(s.coa.coa_no)}</button>` : '';
+  $('#sample-detail').hidden = false;
+  $('#sample-detail').innerHTML = `
+    <h2>Sample — ${esc(s.item_name||'')} · ${esc(s.lot_no||'')} · ${pill(s.status)}</h2>
+    <div class="tblwrap"><table>
+      <thead><tr><th>Parameter</th><th>Spec</th><th>Result</th><th>Verdict</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+    <div class="actions" data-sid="${s.id}">
+      ${closed ? '' : '<button class="go" id="save-results">Save results</button>'}
+      ${closed ? '' : '<button class="mini" id="disp-release">Release</button> <button class="mini" id="disp-reject">Reject</button>'}
+      ${coaBtn}
+      <span class="msg" id="sd-msg"></span>
+    </div>`;
+  $('#sample-detail').scrollIntoView({behavior:'smooth', block:'nearest'});
+}
+
+async function saveResults(sid){
+  const inputs = [...document.querySelectorAll('#sample-detail input[data-param]')];
+  const results = inputs.filter(i=>i.value.trim()!=='').map(i=>({ spec_parameter_id:i.dataset.param, result_value:i.value.trim(), tested_by:'usr-qc' }));
+  const msg = $('#sd-msg'); msg.className='msg';
+  if(!results.length){ msg.textContent='Enter at least one result.'; msg.className='msg err'; return; }
+  const r = await api(`/samples/${sid}/results`, {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({results})});
+  msg.textContent = r.oos ? 'Saved — OUT OF SPEC. Investigate before disposition.' : `Saved — status ${r.status}.`;
+  msg.className = r.oos ? 'msg err' : 'msg ok';
+  await openSample(sid); await loadTiles();
+}
+
+async function dispose(sid, decision){
+  const body = { decision, decided_by:'usr-qc', reason_code: decision==='rejected'?'oos':null };
+  const r = await api(`/samples/${sid}/disposition`, {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body)});
+  await openSample(sid);
+  await Promise.all([loadTiles(), loadQc()]);
+  if(r.coa_no){ const msg=$('#sd-msg'); if(msg){ msg.textContent=`Released. ${r.coa_no} issued.`; msg.className='msg ok'; } }
+}
+
+async function loadSpecs(){
+  const rows = await api('/specs');
+  table($('#tbl-specs'), [
+    {key:'item_name', label:'Item'},
+    {key:'item_code', label:'Code'},
+    {key:'version', label:'Ver', num:true},
+    {key:'status', label:'Status', render:pill},
+    {key:'param_count', label:'Parameters', num:true},
+  ], rows, r => `<button class="mini" data-spec="${r.id}">View</button>`);
+}
+
+async function openSpec(id){
+  const s = await api('/specs/'+id);
+  const rows = s.parameters.map(p=>{
+    const spec = p.result_type==='numeric'
+      ? [ (p.lower_limit!=null?('≥'+p.lower_limit):''), (p.upper_limit!=null?('≤'+p.upper_limit):'') ].filter(Boolean).join(' · ') + (p.uom?(' '+p.uom):'')
+      : esc(p.identity_criterion||'—');
+    return `<tr><td>${esc(p.test_name)}</td><td>${esc(p.method||'')}</td><td>${esc(p.result_type)}</td><td>${spec}</td></tr>`;
+  }).join('');
+  $('#spec-detail').hidden = false;
+  $('#spec-detail').innerHTML = `<h2>${esc(s.item_name)} — spec v${s.version} (${esc(s.status)})</h2>
+    <div class="tblwrap"><table><thead><tr><th>Test</th><th>Method</th><th>Type</th><th>Acceptance</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+async function loadCoas(){
+  const rows = await api('/coas');
+  table($('#tbl-coas'), [
+    {key:'issued_at', label:'Issued'},
+    {key:'coa_no', label:'COA no'},
+    {key:'item_name', label:'Item'},
+    {key:'lot_no', label:'Lot'},
+    {key:'conforms', label:'Conforms', render:v=>Number(v)?pill('released').replace('released','conforms'):pill('rejected').replace('rejected','no')},
+  ], rows, r => `<button class="mini" data-coaview="${r.id}">View</button>`);
+}
+
+async function openCoa(id){
+  const co = await api('/coas/'+id);
+  const rows = co.lines.map(l=>`<tr><td>${esc(l.parameter_name)}</td><td>${esc(l.spec_text||'')}</td><td>${esc(l.result_value||'')}</td><td>${Number(l.conforms)?'✓':'✗'}</td></tr>`).join('');
+  $('#coa-detail').hidden = false;
+  $('#coa-detail').innerHTML = `<h2>${esc(co.coa_no)} — ${esc(co.item_name)} · ${esc(co.lot_no)}</h2>
+    <div style="padding:0 16px 8px" class="muted">Issued ${esc(co.issued_at)} · ${Number(co.conforms)?'Conforms to specification':'Does NOT conform'}${co.expiry_date?(' · Expiry '+esc(co.expiry_date)):''}</div>
+    <div class="tblwrap"><table><thead><tr><th>Parameter</th><th>Specification</th><th>Result</th><th>Conforms</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  $('#coa-detail').scrollIntoView({behavior:'smooth', block:'nearest'});
+}
+
 // Tabs
-const loaders = { stock: loadStock, lots: loadLots, movements: loadMoves, items: loadItems, receive: loadReceiveForm };
+const loaders = { stock: loadStock, lots: loadLots, qc: loadQc, specs: loadSpecs, coas: loadCoas, movements: loadMoves, items: loadItems, receive: loadReceiveForm };
 $('#tabs').addEventListener('click', e => {
   const b = e.target.closest('button[data-tab]'); if(!b) return;
   document.querySelectorAll('#tabs button').forEach(x=>x.classList.toggle('active', x===b));
@@ -259,6 +410,38 @@ $('#rcv-go').addEventListener('click', async () => {
     await Promise.all([loadTiles(), loadStock(), loadLots(), loadMoves()]);
   } catch(err){ msg.textContent = err.message; msg.className='msg err'; }
 });
+
+// QC: pull sample
+$('#qc-pull').addEventListener('click', async () => {
+  const msg = $('#qc-msg'); msg.className='msg';
+  const data = Object.fromEntries(new FormData($('#form-sample')).entries());
+  if(!data.lot_id){ msg.textContent='No lot selected.'; msg.className='msg err'; return; }
+  try {
+    const r = await api('/samples', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({lot_id:data.lot_id, sample_type:data.sample_type, pulled_by:'usr-qc'})});
+    msg.textContent='Sample pulled. Enter results below.'; msg.className='msg ok';
+    await loadQc(); await loadTiles(); await openSample(r.id);
+  } catch(err){ msg.textContent=err.message; msg.className='msg err'; }
+});
+
+// QC: open a sample from the table
+$('#tbl-samples').addEventListener('click', e => {
+  const id = e.target.dataset.sample; if(id) openSample(id).catch(err=>alert(err.message));
+});
+
+// QC: sample detail actions (save results / disposition / view coa)
+$('#sample-detail').addEventListener('click', e => {
+  const sid = e.target.closest('[data-sid]')?.dataset.sid || document.querySelector('#sample-detail [data-sid]')?.dataset.sid;
+  if(e.target.id==='save-results') saveResults(sid).catch(err=>{ const m=$('#sd-msg'); if(m){m.textContent=err.message; m.className='msg err';} });
+  else if(e.target.id==='disp-release') dispose(sid,'released').catch(err=>alert(err.message));
+  else if(e.target.id==='disp-reject') dispose(sid,'rejected').catch(err=>alert(err.message));
+  else if(e.target.dataset.coa) openCoa(e.target.dataset.coa).catch(err=>alert(err.message));
+});
+
+// Specs: view parameters
+$('#tbl-specs').addEventListener('click', e => { const id=e.target.dataset.spec; if(id) openSpec(id).catch(err=>alert(err.message)); });
+
+// COAs: view
+$('#tbl-coas').addEventListener('click', e => { const id=e.target.dataset.coaview; if(id) openCoa(id).catch(err=>alert(err.message)); });
 
 // Boot
 loadTiles().catch(e=>console.error(e));

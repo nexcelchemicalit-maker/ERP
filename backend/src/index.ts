@@ -57,8 +57,15 @@ app.get('/api/dashboard/summary', async (c) => {
     .prepare(`SELECT qc_status status, COUNT(*) n FROM lot GROUP BY qc_status`)
     .all();
 
+  const [samplesOpen, oosOpen, coas] = await Promise.all([
+    one(`SELECT COUNT(*) n FROM sample WHERE status IN ('pending','testing')`),
+    one(`SELECT COUNT(*) n FROM sample WHERE status='oos'`),
+    one(`SELECT COUNT(*) n FROM coa`),
+  ]);
+
   return c.json({
     tiles: { items, lots, released, quarantine, rejected, partners, bins, stockLines },
+    qc: { samplesOpen, oosOpen, coas },
     approxStockValue: value?.v ?? 0,
     lotsByStatus: byStatus.results,
   });
@@ -317,6 +324,253 @@ app.post('/api/adjustments', async (c) => {
   ];
   await db.batch(ops);
   return c.json({ ok: true });
+});
+
+// ================= Phase 2: Quality Control =================
+
+// ---------- Specifications ----------
+app.get('/api/specs', async (c) => {
+  const rows = await c.env.DB.prepare(
+    `SELECT s.id, s.version, s.status, i.code item_code, i.name item_name,
+            (SELECT COUNT(*) FROM spec_parameter p WHERE p.spec_id=s.id) param_count
+     FROM specification s JOIN item i ON i.id=s.item_id
+     ORDER BY i.name, s.version`,
+  ).all();
+  return c.json(rows.results);
+});
+
+app.get('/api/specs/:id', async (c) => {
+  const id = c.req.param('id');
+  const spec = await c.env.DB
+    .prepare(`SELECT s.*, i.code item_code, i.name item_name FROM specification s JOIN item i ON i.id=s.item_id WHERE s.id=?`)
+    .bind(id)
+    .first();
+  if (!spec) return c.json({ error: 'spec not found' }, 404);
+  const params = (await c.env.DB
+    .prepare(`SELECT p.*, u.code uom FROM spec_parameter p LEFT JOIN uom u ON u.id=p.uom_id WHERE p.spec_id=? ORDER BY p.sequence`)
+    .bind(id)
+    .all()).results;
+  return c.json({ ...spec, parameters: params });
+});
+
+// ---------- Samples ----------
+app.get('/api/samples', async (c) => {
+  const rows = await c.env.DB.prepare(
+    `SELECT s.id, s.sample_type, s.status, s.pulled_at,
+            i.name item_name, l.lot_no, l.qc_status lot_status
+     FROM sample s
+     LEFT JOIN lot l  ON l.id=s.lot_id
+     LEFT JOIN item i ON i.id=l.item_id
+     ORDER BY s.pulled_at DESC`,
+  ).all();
+  return c.json(rows.results);
+});
+
+app.get('/api/samples/:id', async (c) => {
+  const id = c.req.param('id');
+  const db = c.env.DB;
+  const s = await db
+    .prepare(
+      `SELECT s.*, l.lot_no, l.qc_status lot_status, i.name item_name, i.code item_code
+       FROM sample s LEFT JOIN lot l ON l.id=s.lot_id LEFT JOIN item i ON i.id=l.item_id WHERE s.id=?`,
+    )
+    .bind(id)
+    .first();
+  if (!s) return c.json({ error: 'sample not found' }, 404);
+  // parameters joined with any recorded result
+  const params = (await db
+    .prepare(
+      `SELECT p.id spec_parameter_id, p.sequence, p.test_name, p.method, p.result_type, p.lower_limit, p.upper_limit,
+              p.target, p.identity_criterion, u.code uom,
+              r.result_value, r.pass_fail, r.is_oos
+       FROM spec_parameter p
+       LEFT JOIN uom u ON u.id=p.uom_id
+       LEFT JOIN test_result r ON r.spec_parameter_id=p.id AND r.sample_id=?
+       WHERE p.spec_id=(SELECT spec_id FROM sample WHERE id=?)
+       ORDER BY p.sequence`,
+    )
+    .bind(id, id)
+    .all()).results;
+  const disp = (await db
+    .prepare(`SELECT decision, reason_code, decided_at FROM qc_disposition WHERE sample_id=? ORDER BY decided_at DESC`)
+    .bind(id)
+    .all()).results;
+  const coa = await db.prepare(`SELECT id, coa_no FROM coa WHERE sample_id=?`).bind(id).first();
+  return c.json({ ...s, parameters: params, dispositions: disp, coa });
+});
+
+// Pull a sample for a lot (defaults to the item's approved spec)
+app.post('/api/samples', async (c) => {
+  const b = await c.req.json();
+  const db = c.env.DB;
+  if (!b.lot_id) return c.json({ error: 'lot_id is required' }, 400);
+  const lot = await db.prepare(`SELECT item_id FROM lot WHERE id=?`).bind(b.lot_id).first<{ item_id: string }>();
+  if (!lot) return c.json({ error: 'lot not found' }, 404);
+  let specId: string | undefined = b.spec_id;
+  if (!specId) {
+    const sp = await db
+      .prepare(`SELECT id FROM specification WHERE item_id=? AND status='approved' ORDER BY version DESC LIMIT 1`)
+      .bind(lot.item_id)
+      .first<{ id: string }>();
+    specId = sp?.id;
+  }
+  if (!specId) return c.json({ error: 'no approved specification exists for this item' }, 400);
+  const id = uid();
+  await db
+    .prepare(
+      `INSERT INTO sample (id,sample_type,lot_id,spec_id,pulled_by,status) VALUES (?,?,?,?,?, 'pending')`,
+    )
+    .bind(id, b.sample_type ?? 'incoming', b.lot_id, specId, b.pulled_by ?? null)
+    .run();
+  return c.json({ id, spec_id: specId }, 201);
+});
+
+// Enter/replace results for a sample; auto-evaluates each against the spec limits
+app.post('/api/samples/:id/results', async (c) => {
+  const id = c.req.param('id');
+  const b = await c.req.json();
+  const db = c.env.DB;
+  const results: Array<{ spec_parameter_id: string; result_value: string; tested_by?: string }> = b.results ?? [];
+  if (!results.length) return c.json({ error: 'results array is required' }, 400);
+
+  // load the relevant parameters to evaluate against
+  const params = (await db
+    .prepare(`SELECT * FROM spec_parameter WHERE spec_id=(SELECT spec_id FROM sample WHERE id=?)`)
+    .bind(id)
+    .all()).results as Array<any>;
+  const byId = new Map(params.map((p) => [p.id, p]));
+
+  const evaluate = (p: any, raw: string): boolean => {
+    if (raw == null || raw === '') return false;
+    if (p.result_type === 'numeric') {
+      const v = parseFloat(raw);
+      if (Number.isNaN(v)) return false;
+      if (p.lower_limit != null && v < p.lower_limit) return false;
+      if (p.upper_limit != null && v > p.upper_limit) return false;
+      return true;
+    }
+    // identity / attribute
+    if (p.identity_criterion == null) return true;
+    return String(raw).trim().toLowerCase() === String(p.identity_criterion).trim().toLowerCase();
+  };
+
+  const ops = [];
+  let anyOos = false;
+  for (const r of results) {
+    const p = byId.get(r.spec_parameter_id);
+    if (!p) continue;
+    const pass = evaluate(p, r.result_value);
+    if (!pass) anyOos = true;
+    ops.push(
+      db
+        .prepare(
+          `INSERT INTO test_result (id,sample_id,spec_parameter_id,result_value,pass_fail,is_oos,tested_by)
+           VALUES (?,?,?,?,?,?,?)
+           ON CONFLICT(sample_id,spec_parameter_id) DO UPDATE SET
+             result_value=excluded.result_value, pass_fail=excluded.pass_fail,
+             is_oos=excluded.is_oos, tested_by=excluded.tested_by, tested_at=datetime('now')`,
+        )
+        .bind(uid(), id, r.spec_parameter_id, r.result_value, pass ? 'pass' : 'fail', pass ? 0 : 1, r.tested_by ?? null),
+    );
+  }
+  // has every parameter now got a result?
+  const total = params.length;
+  const answered = new Set(results.map((r) => r.spec_parameter_id)).size;
+  const status = anyOos ? 'oos' : answered >= total ? 'complete' : 'testing';
+  ops.push(db.prepare(`UPDATE sample SET status=? WHERE id=?`).bind(status, id));
+  await db.batch(ops);
+  return c.json({ id, status, oos: anyOos });
+});
+
+// Disposition a sample -> sets the lot's qc_status; a release issues a COA
+app.post('/api/samples/:id/disposition', async (c) => {
+  const id = c.req.param('id');
+  const b = await c.req.json();
+  const db = c.env.DB;
+  const decisionToStatus: Record<string, string> = {
+    released: 'released',
+    rejected: 'rejected',
+    rework: 'rework',
+    scrapped: 'scrapped',
+    hold: 'quarantine',
+  };
+  const lotStatus = decisionToStatus[b.decision];
+  if (!lotStatus) return c.json({ error: 'decision must be released, rejected, rework, scrapped or hold' }, 400);
+
+  const s = await db
+    .prepare(`SELECT sample_type, lot_id FROM sample WHERE id=?`)
+    .bind(id)
+    .first<{ sample_type: string; lot_id: string }>();
+  if (!s) return c.json({ error: 'sample not found' }, 404);
+
+  const ops = [
+    db.prepare(
+      `INSERT INTO qc_disposition (id,sample_id,target_lot_id,decision,reason_code,decided_by)
+       VALUES (?,?,?,?,?,?)`,
+    ).bind(uid(), id, s.lot_id, b.decision, b.reason_code ?? null, b.decided_by ?? null),
+    db.prepare(`UPDATE sample SET status='closed' WHERE id=?`).bind(id),
+  ];
+  if (s.lot_id) ops.push(db.prepare(`UPDATE lot SET qc_status=? WHERE id=?`).bind(lotStatus, s.lot_id));
+  await db.batch(ops);
+  await audit(db, 'lot', s.lot_id ?? id, 'status_change', { qc_status: lotStatus, via: 'qc_disposition' }, b.decided_by, b.reason_code);
+
+  let coaId: string | null = null;
+  let coaNo: string | null = null;
+  if (b.decision === 'released' && s.lot_id) {
+    coaId = uid();
+    coaNo = 'COA-' + new Date().toISOString().slice(0, 10).replace(/-/g, '') + '-' + coaId.slice(0, 6).toUpperCase();
+    const lines = (await db
+      .prepare(
+        `SELECT p.test_name, p.result_type, p.lower_limit, p.upper_limit, p.identity_criterion, u.code uom,
+                r.result_value, r.is_oos
+         FROM test_result r JOIN spec_parameter p ON p.id=r.spec_parameter_id
+         LEFT JOIN uom u ON u.id=p.uom_id
+         WHERE r.sample_id=? ORDER BY p.sequence`,
+      )
+      .bind(id)
+      .all()).results as Array<any>;
+    const specText = (p: any) => {
+      if (p.result_type !== 'numeric') return p.identity_criterion ?? '';
+      const lo = p.lower_limit, hi = p.upper_limit, u = p.uom ? ' ' + p.uom : '';
+      if (lo != null && hi != null) return `${lo} – ${hi}${u}`;
+      if (hi != null) return `≤ ${hi}${u}`;
+      if (lo != null) return `≥ ${lo}${u}`;
+      return '';
+    };
+    const conforms = lines.every((l) => !l.is_oos) ? 1 : 0;
+    const coaOps = [
+      db.prepare(`INSERT INTO coa (id,lot_id,sample_id,coa_no,conforms,issued_by) VALUES (?,?,?,?,?,?)`).bind(coaId, s.lot_id, id, coaNo, conforms, b.decided_by ?? null),
+      ...lines.map((l) =>
+        db.prepare(`INSERT INTO coa_line (id,coa_id,parameter_name,spec_text,result_value,conforms) VALUES (?,?,?,?,?,?)`).bind(uid(), coaId, l.test_name, specText(l), l.result_value, l.is_oos ? 0 : 1),
+      ),
+    ];
+    await db.batch(coaOps);
+  }
+  return c.json({ id, lot_status: lotStatus, coa_id: coaId, coa_no: coaNo });
+});
+
+// ---------- COAs ----------
+app.get('/api/coas', async (c) => {
+  const rows = await c.env.DB.prepare(
+    `SELECT co.id, co.coa_no, co.conforms, co.issued_at, i.name item_name, l.lot_no
+     FROM coa co JOIN lot l ON l.id=co.lot_id JOIN item i ON i.id=l.item_id
+     ORDER BY co.issued_at DESC`,
+  ).all();
+  return c.json(rows.results);
+});
+
+app.get('/api/coas/:id', async (c) => {
+  const id = c.req.param('id');
+  const co = await c.env.DB
+    .prepare(
+      `SELECT co.*, i.name item_name, i.code item_code, l.lot_no, l.expiry_date
+       FROM coa co JOIN lot l ON l.id=co.lot_id JOIN item i ON i.id=l.item_id WHERE co.id=?`,
+    )
+    .bind(id)
+    .first();
+  if (!co) return c.json({ error: 'coa not found' }, 404);
+  const lines = (await c.env.DB.prepare(`SELECT parameter_name, spec_text, result_value, conforms FROM coa_line WHERE coa_id=?`).bind(id).all()).results;
+  return c.json({ ...co, lines });
 });
 
 // API 404 fallback (static assets are handled by the [assets] binding).

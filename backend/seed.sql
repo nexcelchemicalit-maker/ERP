@@ -1,5 +1,7 @@
 -- Sample data so the dashboard opens in a realistic state. Example data only.
 
+DELETE FROM coa_line; DELETE FROM coa; DELETE FROM qc_disposition; DELETE FROM test_result;
+DELETE FROM sample; DELETE FROM spec_parameter; DELETE FROM specification;
 DELETE FROM count_line; DELETE FROM inventory_count; DELETE FROM reservation;
 DELETE FROM stock_movement; DELETE FROM stock; DELETE FROM lot_genealogy; DELETE FROM lot;
 DELETE FROM bin; DELETE FROM warehouse; DELETE FROM audit_log; DELETE FROM app_user;
@@ -77,3 +79,30 @@ INSERT INTO stock_movement (id,movement_type,lot_id,from_bin_id,to_bin_id,qty,uo
 -- One active reservation against the caustic lot
 INSERT INTO reservation (id,lot_id,qty,uom_id,reserved_for_type,reserved_for_id) VALUES
  ('rsv-1','lot-caus-1',200,'uom-kg','work_order','wo-demo-1');
+
+-- ---------- QC specifications (Phase 2) ----------
+INSERT INTO specification (id,item_id,version,status,effective_date,approved_by) VALUES
+ ('spec-caustic','itm-caustic',1,'approved','2026-01-01','usr-qc'),
+ ('spec-h2so4','itm-sulfacid',1,'approved','2026-01-01','usr-qc'),
+ ('spec-ipa','itm-solvent',1,'approved','2026-01-01','usr-qc'),
+ ('spec-dye','itm-dye',1,'approved','2026-01-01','usr-qc'),
+ ('spec-cleaner','itm-cleaner',1,'approved','2026-01-01','usr-qc');
+
+INSERT INTO spec_parameter (id,spec_id,sequence,test_name,method,result_type,uom_id,lower_limit,upper_limit,target,identity_criterion) VALUES
+ -- Caustic soda
+ ('sp-caus-1','spec-caustic',1,'Assay (NaOH)','Titration','numeric',NULL,98.0,100.5,99.0,NULL),
+ ('sp-caus-2','spec-caustic',2,'Carbonate','Titration','numeric',NULL,NULL,2.0,NULL,NULL),
+ ('sp-caus-3','spec-caustic',3,'Appearance','Visual','identity',NULL,NULL,NULL,NULL,'White flakes'),
+ -- Sulphuric acid
+ ('sp-h2so4-1','spec-h2so4',1,'Assay (H2SO4)','Titration','numeric',NULL,97.0,99.0,98.0,NULL),
+ ('sp-h2so4-2','spec-h2so4',2,'Iron (Fe)','ICP','numeric',NULL,NULL,50.0,NULL,NULL),
+ -- Isopropyl alcohol
+ ('sp-ipa-1','spec-ipa',1,'Purity','GC','numeric',NULL,99.5,100.0,99.8,NULL),
+ ('sp-ipa-2','spec-ipa',2,'Water content','Karl Fischer','numeric',NULL,NULL,0.2,NULL,NULL),
+ ('sp-ipa-3','spec-ipa',3,'Appearance','Visual','identity',NULL,NULL,NULL,NULL,'Clear colourless liquid'),
+ -- Reactive blue dye
+ ('sp-dye-1','spec-dye',1,'Dye content','Spectrophotometry','numeric',NULL,95.0,100.0,98.0,NULL),
+ ('sp-dye-2','spec-dye',2,'Moisture','Loss on drying','numeric',NULL,NULL,5.0,NULL,NULL),
+ -- Finished cleaner
+ ('sp-clean-1','spec-cleaner',1,'Active content','Titration','numeric',NULL,28.0,32.0,30.0,NULL),
+ ('sp-clean-2','spec-cleaner',2,'pH (1% soln)','pH meter','numeric',NULL,9.0,11.0,10.0,NULL);
