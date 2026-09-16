@@ -67,7 +67,7 @@
 <div class="wrap">
   <header class="top">
     <h1>Nexcel ERP</h1>
-    <span class="sub"><span class="dot"></span> Inventory · Quality · Phase 2</span>
+    <span class="sub"><span class="dot"></span> Inventory · Formulation · Production · Quality — Phase 4</span>
     <span class="sub" style="margin-left:auto" id="clock"></span>
   </header>
 
@@ -77,6 +77,7 @@
     <button data-tab="stock" class="active">Stock on hand</button>
     <button data-tab="lots">Lots</button>
     <button data-tab="formulas">Formulas</button>
+    <button data-tab="production">Production</button>
     <button data-tab="qc">Quality (QC)</button>
     <button data-tab="specs">Specifications</button>
     <button data-tab="coas">COAs</button>
@@ -96,6 +97,27 @@
   <section class="panel" id="panel-formulas">
     <div class="card"><h2>Formulas (Master Batch Records)</h2><div class="tblwrap"><table id="tbl-formulas"></table></div></div>
     <div class="card" id="formula-detail" hidden></div>
+  </section>
+
+  <section class="panel" id="panel-production">
+    <div class="card">
+      <h2>New work order</h2>
+      <form class="grid" id="form-wo">
+        <label>Approved formula
+          <select name="formula_id" id="wo-formula" required></select>
+        </label>
+        <label>Planned quantity
+          <input name="planned_qty" type="number" step="any" min="0" required placeholder="e.g. 500" />
+        </label>
+        <label>Equipment
+          <select name="equipment_id" id="wo-equip"><option value="">(unassigned)</option></select>
+        </label>
+      </form>
+      <div class="actions"><button class="go" id="wo-go">Create work order</button><span class="msg" id="wo-msg"></span></div>
+    </div>
+    <div class="card"><h2>Work orders</h2><div class="tblwrap"><table id="tbl-wos"></table></div></div>
+    <div class="card"><h2>Batches</h2><div class="tblwrap"><table id="tbl-batches"></table></div></div>
+    <div class="card" id="batch-detail" hidden></div>
   </section>
 
   <section class="panel" id="panel-qc">
@@ -197,10 +219,12 @@ async function loadTiles(){
   const s = await api('/dashboard/summary');
   const t = s.tiles;
   const q = s.qc || {samplesOpen:0, oosOpen:0, coas:0};
+  const pr = s.production || {woOpen:0, batchesActive:0, batchesDone:0};
   const cells = [
     ['Items', t.items], ['Lots', t.lots],
     ['Released', t.released], ['In quarantine', t.quarantine],
     ['QC open', q.samplesOpen], ['OOS', q.oosOpen], ['COAs', q.coas],
+    ['WO open', pr.woOpen], ['Batches active', pr.batchesActive],
     ['Approx. value', money(s.approxStockValue)],
   ];
   $('#tiles').innerHTML = cells.map(([k,v])=>`<div class="tile"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
@@ -303,6 +327,79 @@ async function openFormula(id){
     <div class="tblwrap" style="margin-top:8px"><table><thead><tr><th>Packaging</th><th class="num">Per base</th><th class="num">Cost</th></tr></thead><tbody>${pkg||'<tr><td colspan="3" class="muted">None</td></tr>'}</tbody></table></div>
     <div class="actions">${approveBtn}<span class="msg" id="fd-msg"></span></div>`;
   $('#formula-detail').scrollIntoView({behavior:'smooth', block:'nearest'});
+}
+
+// ---------- Production ----------
+let _lotsCache = [];
+let _openBatchId = null;
+async function loadProduction(){
+  const [formulas, equip, wos, batches, lots] = await Promise.all([api('/formulas'), api('/equipment'), api('/work-orders'), api('/batches'), api('/lots')]);
+  _lotsCache = lots;
+  const approved = formulas.filter(f=>f.status==='approved');
+  $('#wo-formula').innerHTML = approved.length
+    ? approved.map(f=>`<option value="${f.id}">${esc(f.product_name)} v${f.version} (base ${esc(f.base_qty)} ${esc(f.base_uom)})</option>`).join('')
+    : '<option value="">No approved formulas</option>';
+  $('#wo-equip').innerHTML = '<option value="">(unassigned)</option>' + equip.map(e=>`<option value="${e.id}">${esc(e.code)} — ${esc(e.name)}</option>`).join('');
+  table($('#tbl-wos'), [
+    {key:'product_name', label:'Product'},
+    {key:'formula_version', label:'Formula', render:v=>'v'+esc(v)},
+    {key:'planned_qty', label:'Planned', num:true, render:(v,r)=>esc(v)+' '+esc(r.uom)},
+    {key:'status', label:'Status', render:pill},
+    {key:'batch_count', label:'Batches', num:true},
+  ], wos, r => (r.status==='planned'||r.status==='released') ? `<button class="mini" data-startbatch="${r.id}">Start batch</button>` : '<span class="muted">—</span>');
+  table($('#tbl-batches'), [
+    {key:'batch_no', label:'Batch'},
+    {key:'product_name', label:'Product'},
+    {key:'status', label:'Status', render:pill},
+    {key:'actual_qty', label:'Actual', num:true},
+    {key:'actual_cost', label:'Cost', num:true, render:v=>v!=null?money(v):''},
+  ], batches, r => `<button class="mini" data-openbatch="${r.id}">Open</button>`);
+}
+
+async function openBatch(id){
+  _openBatchId = id;
+  const b = await api('/batches/'+id);
+  const closed = ['completed','closed','rejected'].includes(b.status);
+  const mats = b.materials.map(m=>{
+    if(m.actual_qty!=null){
+      return `<tr><td>${esc(m.item_name)}</td><td class="num">${esc(m.planned_qty)} ${esc(m.uom)}</td><td class="num">${esc(m.actual_qty)} ${esc(m.uom)}</td><td>${esc(m.lot_no||'')} ${m.qc_status?pill(m.qc_status):''}</td><td></td></tr>`;
+    }
+    const eligible = _lotsCache.filter(l=>l.item_code===m.item_code && l.qc_status==='released' && Number(l.qty_on_hand)>0);
+    const opts = eligible.length ? eligible.map(l=>`<option value="${l.id}">${esc(l.lot_no)} (${esc(l.qty_on_hand)})</option>`).join('') : '<option value="">no released lot</option>';
+    const controls = closed ? '' : `<select data-lotfor="${m.id}" style="min-width:120px">${opts}</select>
+        <input data-qtyfor="${m.id}" type="number" step="any" value="${esc(m.planned_qty)}" style="width:90px"/>
+        <button class="mini" data-dispense="${m.id}">Dispense</button>`;
+    return `<tr><td>${esc(m.item_name)}</td><td class="num">${esc(m.planned_qty)} ${esc(m.uom)}</td><td class="num muted">—</td><td colspan="2">${controls}</td></tr>`;
+  }).join('');
+  const steps = b.steps.map(s=>{
+    const ipc = Number(s.is_ipc_checkpoint) ? ' '+pill('quarantine').replace('quarantine','IPC') : '';
+    const act = (s.status==='done') ? pill('released').replace('released','done')
+      : (closed ? '<span class="muted">—</span>' : `<button class="mini" data-step="${s.id}">Mark done</button>`);
+    return `<tr><td>${esc(s.step_no)}</td><td>${esc(s.instruction)}${ipc}</td><td>${act}</td></tr>`;
+  }).join('');
+  const outs = b.outputs.map(o=>`<tr><td>${esc(o.output_type)}</td><td>${esc(o.item_name)}</td><td class="num">${esc(o.qty)} ${esc(o.uom)}</td><td>${esc(o.lot_no)} ${pill(o.qc_status)}</td></tr>`).join('');
+  const cost = b.cost ? `<div style="padding:8px 16px" class="muted">Material ${money(b.cost.material_cost)} + Packaging ${money(b.cost.packaging_cost)} + Labour ${money(b.cost.labor_cost)} + Machine ${money(b.cost.machine_cost)} = <strong>${money(b.cost.actual_total)}</strong> actual · standard ${money(b.cost.standard_total)} · variance <strong style="color:${b.cost.variance>0?'var(--danger)':'var(--ok)'}">${money(b.cost.variance)}</strong></div>` : '';
+  const canComplete = !closed;
+  const completeBlock = canComplete ? `
+    <div class="actions" style="flex-wrap:wrap">
+      <label style="flex-direction:row; align-items:center; gap:6px">Product yield <input id="out-qty" type="number" step="any" value="${esc(b.planned_qty)}" style="width:110px"/></label>
+      <label style="flex-direction:row; align-items:center; gap:6px">Labour ₹<input id="out-labor" type="number" step="any" value="0" style="width:90px"/></label>
+      <label style="flex-direction:row; align-items:center; gap:6px">Machine ₹<input id="out-machine" type="number" step="any" value="0" style="width:90px"/></label>
+      <button class="go" data-complete="${b.id}" data-prod="${b.product_item_id}" data-uom="${b.uom_id}">Complete batch</button>
+    </div>` : '';
+  const closeBtn = b.status==='completed' ? `<div class="actions"><button class="go" data-closebatch="${b.id}">Close (review lock)</button></div>` : '';
+  $('#batch-detail').hidden = false;
+  $('#batch-detail').innerHTML = `
+    <h2>${esc(b.batch_no)} — ${esc(b.product_name)} ${pill(b.status)}</h2>
+    <h2 style="border-top:none">Materials</h2>
+    <div class="tblwrap"><table><thead><tr><th>Item</th><th class="num">Planned</th><th class="num">Actual</th><th colspan="2">Lot / dispense</th></tr></thead><tbody>${mats}</tbody></table></div>
+    <h2>Process steps</h2>
+    <div class="tblwrap"><table><thead><tr><th>Step</th><th>Instruction</th><th>Action</th></tr></thead><tbody>${steps}</tbody></table></div>
+    ${outs?`<h2>Outputs</h2><div class="tblwrap"><table><thead><tr><th>Type</th><th>Item</th><th class="num">Qty</th><th>Lot</th></tr></thead><tbody>${outs}</tbody></table></div>`:''}
+    ${cost}
+    ${completeBlock}${closeBtn}
+    <div class="actions"><span class="msg" id="bd-msg"></span></div>`;
+  $('#batch-detail').scrollIntoView({behavior:'smooth', block:'nearest'});
 }
 
 // ---------- Quality (QC) ----------
@@ -418,7 +515,7 @@ async function openCoa(id){
 }
 
 // Tabs
-const loaders = { stock: loadStock, lots: loadLots, formulas: loadFormulas, qc: loadQc, specs: loadSpecs, coas: loadCoas, movements: loadMoves, items: loadItems, receive: loadReceiveForm };
+const loaders = { stock: loadStock, lots: loadLots, formulas: loadFormulas, production: loadProduction, qc: loadQc, specs: loadSpecs, coas: loadCoas, movements: loadMoves, items: loadItems, receive: loadReceiveForm };
 $('#tabs').addEventListener('click', e => {
   const b = e.target.closest('button[data-tab]'); if(!b) return;
   document.querySelectorAll('#tabs button').forEach(x=>x.classList.toggle('active', x===b));
@@ -477,6 +574,51 @@ $('#sample-detail').addEventListener('click', e => {
   else if(e.target.id==='disp-release') dispose(sid,'released').catch(err=>alert(err.message));
   else if(e.target.id==='disp-reject') dispose(sid,'rejected').catch(err=>alert(err.message));
   else if(e.target.dataset.coa) openCoa(e.target.dataset.coa).catch(err=>alert(err.message));
+});
+
+// Production: create work order
+$('#wo-go').addEventListener('click', async () => {
+  const msg=$('#wo-msg'); msg.className='msg';
+  const d = Object.fromEntries(new FormData($('#form-wo')).entries());
+  if(!d.formula_id || !d.planned_qty){ msg.textContent='Pick a formula and quantity.'; msg.className='msg err'; return; }
+  if(!d.equipment_id) delete d.equipment_id; d.planned_qty=Number(d.planned_qty);
+  try { await api('/work-orders',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(d)});
+    msg.textContent='Work order created.'; msg.className='msg ok'; await loadProduction(); await loadTiles(); }
+  catch(err){ msg.textContent=err.message; msg.className='msg err'; }
+});
+// Production: start batch from a WO
+$('#tbl-wos').addEventListener('click', async e => {
+  const wid=e.target.dataset.startbatch; if(!wid) return;
+  try { const r=await api('/batches',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({work_order_id:wid})});
+    await loadProduction(); await loadTiles(); await openBatch(r.id); }
+  catch(err){ alert(err.message); }
+});
+// Production: open a batch
+$('#tbl-batches').addEventListener('click', e => { const id=e.target.dataset.openbatch; if(id) openBatch(id).catch(err=>alert(err.message)); });
+// Production: batch detail actions
+$('#batch-detail').addEventListener('click', async e => {
+  const t=e.target, msg=$('#bd-msg'); if(msg) msg.className='msg';
+  try {
+    if(t.dataset.dispense){
+      const mid=t.dataset.dispense; const lot=document.querySelector(`[data-lotfor="${mid}"]`).value;
+      const qty=Number(document.querySelector(`[data-qtyfor="${mid}"]`).value);
+      if(!lot){ if(msg){msg.textContent='No released lot to dispense.'; msg.className='msg err';} return; }
+      await api(`/batches/${_openBatchId}/materials/${mid}/dispense`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({lot_id:lot,actual_qty:qty,dispensed_by:'usr-admin'})});
+      await loadProduction(); await openBatch(_openBatchId);
+    } else if(t.dataset.step){
+      await api(`/batches/${_openBatchId}/steps/${t.dataset.step}/complete`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({performed_by:'usr-admin'})});
+      await openBatch(_openBatchId); await loadTiles();
+    } else if(t.dataset.complete){
+      const qty=Number($('#out-qty').value), labor=Number($('#out-labor').value)||0, machine=Number($('#out-machine').value)||0;
+      const outputs=[{item_id:t.dataset.prod, qty, uom_id:t.dataset.uom, output_type:'product'}];
+      const r=await api(`/batches/${t.dataset.complete}/complete`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({outputs,labor_cost:labor,machine_cost:machine,performed_by:'usr-admin'})});
+      await loadProduction(); await loadTiles(); await openBatch(_openBatchId);
+      if(msg){ msg.textContent=`Completed. Actual ${money(r.actual_cost)} vs standard ${money(r.standard_cost)} (variance ${money(r.variance)}).`; msg.className='msg ok'; }
+    } else if(t.dataset.closebatch){
+      await api(`/batches/${t.dataset.closebatch}/close`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({reviewed_by:'usr-admin'})});
+      await loadProduction(); await openBatch(_openBatchId);
+    }
+  } catch(err){ if(msg){msg.textContent=err.message; msg.className='msg err';} else alert(err.message); }
 });
 
 // Formulas: view + approve

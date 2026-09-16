@@ -57,15 +57,19 @@ app.get('/api/dashboard/summary', async (c) => {
     .prepare(`SELECT qc_status status, COUNT(*) n FROM lot GROUP BY qc_status`)
     .all();
 
-  const [samplesOpen, oosOpen, coas] = await Promise.all([
+  const [samplesOpen, oosOpen, coas, woOpen, batchesActive, batchesDone] = await Promise.all([
     one(`SELECT COUNT(*) n FROM sample WHERE status IN ('pending','testing')`),
     one(`SELECT COUNT(*) n FROM sample WHERE status='oos'`),
     one(`SELECT COUNT(*) n FROM coa`),
+    one(`SELECT COUNT(*) n FROM work_order WHERE status IN ('planned','released','in_progress')`),
+    one(`SELECT COUNT(*) n FROM batch WHERE status IN ('in_progress','on_hold')`),
+    one(`SELECT COUNT(*) n FROM batch WHERE status IN ('completed','closed')`),
   ]);
 
   return c.json({
     tiles: { items, lots, released, quarantine, rejected, partners, bins, stockLines },
     qc: { samplesOpen, oosOpen, coas },
+    production: { woOpen, batchesActive, batchesDone },
     approxStockValue: value?.v ?? 0,
     lotsByStatus: byStatus.results,
   });
@@ -694,6 +698,263 @@ app.post('/api/formulas/:id/approve', async (c) => {
   if (!res.meta.changes) return c.json({ error: 'formula not found or not in draft' }, 400);
   await audit(c.env.DB, 'formula', id, 'status_change', { status: 'approved' }, b.approved_by);
   return c.json({ id, status: 'approved' });
+});
+
+// ================= Phase 4: Production =================
+
+app.get('/api/equipment', async (c) =>
+  c.json((await c.env.DB.prepare(`SELECT e.*, u.code capacity_uom FROM equipment e LEFT JOIN uom u ON u.id=e.capacity_uom_id ORDER BY e.code`).all()).results),
+);
+
+// Create a work order from an approved formula (computes the scale factor)
+app.post('/api/work-orders', async (c) => {
+  const b = await c.req.json();
+  const db = c.env.DB;
+  if (!b.formula_id || !b.planned_qty) return c.json({ error: 'formula_id and planned_qty are required' }, 400);
+  const f = await db
+    .prepare(`SELECT product_item_id, base_qty, base_uom_id, status FROM formula WHERE id=?`)
+    .bind(b.formula_id)
+    .first<{ product_item_id: string; base_qty: number; base_uom_id: string; status: string }>();
+  if (!f) return c.json({ error: 'formula not found' }, 404);
+  if (f.status !== 'approved') return c.json({ error: 'formula is not approved' }, 400);
+  const id = uid();
+  const scale = b.planned_qty / f.base_qty;
+  await db
+    .prepare(
+      `INSERT INTO work_order (id,formula_id,product_item_id,planned_qty,uom_id,scale_factor,equipment_id,status,planned_start)
+       VALUES (?,?,?,?,?,?,?, 'planned', ?)`,
+    )
+    .bind(id, b.formula_id, f.product_item_id, b.planned_qty, f.base_uom_id, scale, b.equipment_id ?? null, b.planned_start ?? null)
+    .run();
+  return c.json({ id, scale_factor: scale }, 201);
+});
+
+app.get('/api/work-orders', async (c) => {
+  const rows = await c.env.DB.prepare(
+    `SELECT w.id, w.planned_qty, w.scale_factor, w.status, u.code uom,
+            i.name product_name, f.version formula_version, e.code equipment_code,
+            (SELECT COUNT(*) FROM batch b WHERE b.work_order_id=w.id) batch_count
+     FROM work_order w
+     JOIN item i ON i.id=w.product_item_id
+     JOIN formula f ON f.id=w.formula_id
+     JOIN uom u ON u.id=w.uom_id
+     LEFT JOIN equipment e ON e.id=w.equipment_id
+     ORDER BY w.created_at DESC`,
+  ).all();
+  return c.json(rows.results);
+});
+
+// Start a batch from a work order: pre-populates planned materials (scaled) and steps
+app.post('/api/batches', async (c) => {
+  const b = await c.req.json();
+  const db = c.env.DB;
+  if (!b.work_order_id) return c.json({ error: 'work_order_id is required' }, 400);
+  const wo = await db
+    .prepare(`SELECT formula_id, product_item_id, uom_id, scale_factor FROM work_order WHERE id=?`)
+    .bind(b.work_order_id)
+    .first<{ formula_id: string; product_item_id: string; uom_id: string; scale_factor: number }>();
+  if (!wo) return c.json({ error: 'work order not found' }, 404);
+
+  const ingredients = (await db.prepare(`SELECT * FROM formula_ingredient WHERE formula_id=? ORDER BY sequence`).bind(wo.formula_id).all()).results as Array<any>;
+  const steps = (await db.prepare(`SELECT * FROM formula_step WHERE formula_id=? ORDER BY step_no`).bind(wo.formula_id).all()).results as Array<any>;
+
+  const batchId = uid();
+  const count = (await db.prepare(`SELECT COUNT(*) n FROM batch`).first<{ n: number }>())?.n ?? 0;
+  const batchNo = b.batch_no ?? 'B' + new Date().toISOString().slice(2, 10).replace(/-/g, '') + '-' + String(count + 1).padStart(3, '0');
+
+  const ops = [
+    db.prepare(`INSERT INTO batch (id,work_order_id,batch_no,uom_id,status,started_at) VALUES (?,?,?,?, 'in_progress', datetime('now'))`).bind(batchId, b.work_order_id, batchNo, wo.uom_id),
+    db.prepare(`UPDATE work_order SET status='in_progress' WHERE id=?`).bind(b.work_order_id),
+  ];
+  for (const ing of ingredients) {
+    ops.push(
+      db.prepare(`INSERT INTO batch_material (id,batch_id,item_id,planned_qty,uom_id) VALUES (?,?,?,?,?)`).bind(uid(), batchId, ing.item_id, ing.qty * wo.scale_factor, ing.uom_id),
+    );
+  }
+  for (const s of steps) {
+    ops.push(
+      db.prepare(`INSERT INTO batch_step (id,batch_id,formula_step_id,step_no,instruction,is_ipc_checkpoint) VALUES (?,?,?,?,?,?)`).bind(uid(), batchId, s.id, s.step_no, s.instruction, s.is_ipc_checkpoint),
+    );
+  }
+  await db.batch(ops);
+  return c.json({ id: batchId, batch_no: batchNo }, 201);
+});
+
+app.get('/api/batches', async (c) => {
+  const rows = await c.env.DB.prepare(
+    `SELECT b.id, b.batch_no, b.status, b.actual_qty, u.code uom, i.name product_name,
+            w.planned_qty,
+            (SELECT actual_total FROM batch_cost bc WHERE bc.batch_id=b.id) actual_cost
+     FROM batch b
+     JOIN work_order w ON w.id=b.work_order_id
+     JOIN item i ON i.id=w.product_item_id
+     LEFT JOIN uom u ON u.id=b.uom_id
+     ORDER BY b.created_at DESC`,
+  ).all();
+  return c.json(rows.results);
+});
+
+app.get('/api/batches/:id', async (c) => {
+  const id = c.req.param('id');
+  const db = c.env.DB;
+  const b = await db
+    .prepare(
+      `SELECT b.*, i.name product_name, w.product_item_id, w.planned_qty, w.scale_factor
+       FROM batch b JOIN work_order w ON w.id=b.work_order_id JOIN item i ON i.id=w.product_item_id WHERE b.id=?`,
+    )
+    .bind(id)
+    .first();
+  if (!b) return c.json({ error: 'batch not found' }, 404);
+  const materials = (await db
+    .prepare(
+      `SELECT bm.id, bm.planned_qty, bm.actual_qty, u.code uom, i.code item_code, i.name item_name, bm.item_id,
+              l.lot_no, l.qc_status
+       FROM batch_material bm JOIN item i ON i.id=bm.item_id JOIN uom u ON u.id=bm.uom_id
+       LEFT JOIN lot l ON l.id=bm.lot_id WHERE bm.batch_id=? ORDER BY i.name`,
+    )
+    .bind(id)
+    .all()).results;
+  const steps = (await db.prepare(`SELECT id, step_no, instruction, is_ipc_checkpoint, status, actual_param_value, ipc_sample_id FROM batch_step WHERE batch_id=? ORDER BY step_no`).bind(id).all()).results;
+  const outputs = (await db
+    .prepare(`SELECT bo.output_type, bo.qty, u.code uom, i.name item_name, l.lot_no, l.qc_status FROM batch_output bo JOIN item i ON i.id=bo.item_id JOIN uom u ON u.id=bo.uom_id JOIN lot l ON l.id=bo.lot_id WHERE bo.batch_id=?`)
+    .bind(id)
+    .all()).results;
+  const cost = await db.prepare(`SELECT * FROM batch_cost WHERE batch_id=?`).bind(id).first();
+  return c.json({ ...b, materials, steps, outputs, cost });
+});
+
+// Dispense a released lot against a planned material line
+app.post('/api/batches/:id/materials/:mid/dispense', async (c) => {
+  const mid = c.req.param('mid');
+  const b = await c.req.json();
+  const db = c.env.DB;
+  if (!b.lot_id || b.actual_qty === undefined) return c.json({ error: 'lot_id and actual_qty are required' }, 400);
+
+  const bm = await db.prepare(`SELECT item_id, uom_id FROM batch_material WHERE id=?`).bind(mid).first<{ item_id: string; uom_id: string }>();
+  if (!bm) return c.json({ error: 'material line not found' }, 400);
+  const lot = await db.prepare(`SELECT item_id, qc_status FROM lot WHERE id=?`).bind(b.lot_id).first<{ item_id: string; qc_status: string }>();
+  if (!lot) return c.json({ error: 'lot not found' }, 404);
+  if (lot.qc_status !== 'released') return c.json({ error: 'lot is not QC-released' }, 400);
+  const isSub = lot.item_id !== bm.item_id;
+
+  // find a stock row (released lot) with enough available
+  const st = await db
+    .prepare(`SELECT id, bin_id, qty_on_hand, qty_reserved FROM stock WHERE lot_id=? AND uom_id=? AND (qty_on_hand-qty_reserved) >= ? ORDER BY (qty_on_hand-qty_reserved) DESC LIMIT 1`)
+    .bind(b.lot_id, bm.uom_id, b.actual_qty)
+    .first<{ id: string; bin_id: string }>();
+  if (!st) return c.json({ error: 'not enough available stock of this lot to dispense' }, 400);
+
+  await db.batch([
+    db.prepare(`UPDATE stock SET qty_on_hand=qty_on_hand-?, updated_at=datetime('now') WHERE id=?`).bind(b.actual_qty, st.id),
+    db.prepare(`UPDATE batch_material SET actual_qty=?, lot_id=?, is_substitute=?, dispensed_by=?, dispensed_at=datetime('now') WHERE id=?`).bind(b.actual_qty, b.lot_id, isSub ? 1 : 0, b.dispensed_by ?? null, mid),
+    db.prepare(`INSERT INTO stock_movement (id,movement_type,lot_id,from_bin_id,qty,uom_id,ref_type,ref_id,performed_by) VALUES (?, 'issue_to_production', ?, ?, ?, ?, 'batch', ?, ?)`).bind(uid(), b.lot_id, st.bin_id, b.actual_qty, bm.uom_id, c.req.param('id'), b.dispensed_by ?? null),
+  ]);
+  return c.json({ ok: true, is_substitute: isSub });
+});
+
+// Complete a step; an IPC checkpoint pulls an in-process sample and holds the batch
+app.post('/api/batches/:id/steps/:sid/complete', async (c) => {
+  const batchId = c.req.param('id');
+  const sid = c.req.param('sid');
+  const b = await c.req.json().catch(() => ({}));
+  const db = c.env.DB;
+  const step = await db.prepare(`SELECT is_ipc_checkpoint FROM batch_step WHERE id=?`).bind(sid).first<{ is_ipc_checkpoint: number }>();
+  if (!step) return c.json({ error: 'step not found' }, 404);
+
+  let sampleId: string | null = null;
+  const ops = [
+    db.prepare(`UPDATE batch_step SET status='done', actual_param_value=?, performed_by=?, performed_at=datetime('now') WHERE id=?`).bind(b.actual_param_value ?? null, b.performed_by ?? null, sid),
+  ];
+  if (step.is_ipc_checkpoint) {
+    const prod = await db
+      .prepare(`SELECT w.product_item_id FROM batch bt JOIN work_order w ON w.id=bt.work_order_id WHERE bt.id=?`)
+      .bind(batchId)
+      .first<{ product_item_id: string }>();
+    const spec = prod
+      ? await db.prepare(`SELECT id FROM specification WHERE item_id=? AND status='approved' ORDER BY version DESC LIMIT 1`).bind(prod.product_item_id).first<{ id: string }>()
+      : null;
+    if (spec) {
+      sampleId = uid();
+      ops.push(db.prepare(`INSERT INTO sample (id,sample_type,batch_id,batch_step_id,spec_id,pulled_by,status) VALUES (?, 'in_process', ?, ?, ?, ?, 'pending')`).bind(sampleId, batchId, sid, spec.id, b.performed_by ?? null));
+      ops.push(db.prepare(`UPDATE batch_step SET ipc_sample_id=? WHERE id=?`).bind(sampleId, sid));
+      ops.push(db.prepare(`UPDATE batch SET status='on_hold' WHERE id=? AND status='in_progress'`).bind(batchId));
+    }
+  }
+  await db.batch(ops);
+  return c.json({ ok: true, ipc_sample_id: sampleId });
+});
+
+// Complete a batch: book outputs (new lots + stock + genealogy), roll up actual cost
+app.post('/api/batches/:id/complete', async (c) => {
+  const id = c.req.param('id');
+  const b = await c.req.json();
+  const db = c.env.DB;
+  const outputs: Array<{ item_id: string; qty: number; uom_id: string; output_type: string; lot_no?: string }> = b.outputs ?? [];
+  if (!outputs.length) return c.json({ error: 'at least one output is required' }, 400);
+
+  const batch = await db.prepare(`SELECT batch_no, work_order_id FROM batch WHERE id=?`).bind(id).first<{ batch_no: string; work_order_id: string }>();
+  if (!batch) return c.json({ error: 'batch not found' }, 404);
+  const wo = await db.prepare(`SELECT formula_id, scale_factor FROM work_order WHERE id=?`).bind(batch.work_order_id).first<{ formula_id: string; scale_factor: number }>();
+
+  const fgBin = await db.prepare(`SELECT id FROM bin WHERE zone='Finished goods' AND is_active=1 LIMIT 1`).first<{ id: string }>();
+  const qBin = await db.prepare(`SELECT id FROM bin WHERE zone='Quarantine' AND is_active=1 LIMIT 1`).first<{ id: string }>();
+  const anyBin = await db.prepare(`SELECT id FROM bin WHERE is_active=1 LIMIT 1`).first<{ id: string }>();
+  const pickBin = (t: string) => (t === 'waste' ? qBin?.id : fgBin?.id) ?? qBin?.id ?? anyBin?.id;
+
+  const consumed = (await db.prepare(`SELECT DISTINCT lot_id FROM batch_material WHERE batch_id=? AND lot_id IS NOT NULL`).bind(id).all()).results as Array<{ lot_id: string }>;
+
+  const ops = [];
+  const createdOutputs: Array<{ lotId: string; type: string }> = [];
+  let productQty = 0;
+  let idx = 0;
+  for (const o of outputs) {
+    idx++;
+    const lotId = uid();
+    const status = o.output_type === 'waste' ? 'released' : 'quarantine';
+    const lotNo = o.lot_no ?? `${batch.batch_no}-${o.output_type[0].toUpperCase()}${idx}`;
+    const binId = pickBin(o.output_type);
+    ops.push(db.prepare(`INSERT INTO lot (id,item_id,lot_no,origin_type,origin_ref_id,qc_status) VALUES (?,?,?, 'production', ?, ?)`).bind(lotId, o.item_id, lotNo, id, status));
+    ops.push(db.prepare(`INSERT INTO stock (id,lot_id,bin_id,uom_id,qty_on_hand,qty_reserved) VALUES (?,?,?,?,?,0)`).bind(uid(), lotId, binId, o.uom_id, o.qty));
+    ops.push(db.prepare(`INSERT INTO stock_movement (id,movement_type,lot_id,to_bin_id,qty,uom_id,ref_type,ref_id,performed_by) VALUES (?, 'output_from_production', ?, ?, ?, ?, 'batch', ?, ?)`).bind(uid(), lotId, binId, o.qty, o.uom_id, id, b.performed_by ?? null));
+    ops.push(db.prepare(`INSERT INTO batch_output (id,batch_id,item_id,lot_id,qty,uom_id,output_type) VALUES (?,?,?,?,?,?,?)`).bind(uid(), id, o.item_id, lotId, o.qty, o.uom_id, o.output_type));
+    createdOutputs.push({ lotId, type: o.output_type });
+    if (o.output_type === 'product') productQty += o.qty;
+  }
+  // genealogy: each consumed raw lot -> each product/co_product output lot
+  for (const cm of consumed) {
+    for (const co of createdOutputs) {
+      if (co.type === 'product' || co.type === 'co_product') {
+        ops.push(db.prepare(`INSERT INTO lot_genealogy (id,parent_lot_id,child_lot_id,batch_id,relationship) VALUES (?,?,?,?, 'consumed_into')`).bind(uid(), cm.lot_id, co.lotId, id));
+      }
+    }
+  }
+  ops.push(db.prepare(`UPDATE batch SET status='completed', actual_qty=?, completed_at=datetime('now') WHERE id=?`).bind(productQty, id));
+  ops.push(db.prepare(`UPDATE work_order SET status='completed' WHERE id=?`).bind(batch.work_order_id));
+
+  // ---- costing ----
+  const matCost = (await db.prepare(`SELECT COALESCE(SUM(bm.actual_qty*i.standard_cost),0) c FROM batch_material bm JOIN item i ON i.id=bm.item_id WHERE bm.batch_id=? AND bm.actual_qty IS NOT NULL`).bind(id).first<{ c: number }>())?.c ?? 0;
+  const scale = wo?.scale_factor ?? 1;
+  const pkgBase = wo ? (await formulaCosts(db, wo.formula_id)).packaging_cost : 0;
+  const stdBase = wo ? (await formulaCosts(db, wo.formula_id)).total_cost : 0;
+  const packaging = pkgBase * scale;
+  const labor = b.labor_cost ?? 0;
+  const machine = b.machine_cost ?? 0;
+  const actual = matCost + packaging + labor + machine;
+  const standard = stdBase * scale;
+  ops.push(db.prepare(`INSERT INTO batch_cost (id,batch_id,material_cost,packaging_cost,labor_cost,machine_cost,actual_total,standard_total,variance) VALUES (?,?,?,?,?,?,?,?,?)`).bind(uid(), id, matCost, packaging, labor, machine, actual, standard, actual - standard));
+
+  await db.batch(ops);
+  return c.json({ ok: true, product_qty: productQty, actual_cost: actual, standard_cost: standard, variance: actual - standard });
+});
+
+// Close (review-lock) a completed batch
+app.post('/api/batches/:id/close', async (c) => {
+  const id = c.req.param('id');
+  const b = await c.req.json().catch(() => ({}));
+  const res = await c.env.DB.prepare(`UPDATE batch SET status='closed', reviewed_by=?, closed_at=datetime('now') WHERE id=? AND status='completed'`).bind(b.reviewed_by ?? null, id).run();
+  if (!res.meta.changes) return c.json({ error: 'batch not found or not completed' }, 400);
+  await audit(c.env.DB, 'batch', id, 'status_change', { status: 'closed' }, b.reviewed_by);
+  return c.json({ id, status: 'closed' });
 });
 
 // API 404 fallback (static assets are handled by the [assets] binding).

@@ -1,5 +1,7 @@
 -- Sample data so the dashboard opens in a realistic state. Example data only.
 
+DELETE FROM batch_cost; DELETE FROM deviation; DELETE FROM batch_output; DELETE FROM batch_material;
+DELETE FROM batch_step; DELETE FROM batch; DELETE FROM work_order; DELETE FROM equipment;
 DELETE FROM packaging_spec; DELETE FROM formula_step; DELETE FROM formula_ingredient; DELETE FROM formula;
 DELETE FROM coa_line; DELETE FROM coa; DELETE FROM qc_disposition; DELETE FROM test_result;
 DELETE FROM sample; DELETE FROM spec_parameter; DELETE FROM specification;
@@ -82,6 +84,15 @@ INSERT INTO stock_movement (id,movement_type,lot_id,from_bin_id,to_bin_id,qty,uo
 INSERT INTO reservation (id,lot_id,qty,uom_id,reserved_for_type,reserved_for_id) VALUES
  ('rsv-1','lot-caus-1',200,'uom-kg','work_order','wo-demo-1');
 
+-- Extra QC-released feedstock so a production batch can be dispensed end-to-end
+-- (the IPA lot above stays in quarantine to demonstrate the QC flow).
+INSERT INTO lot (id,item_id,lot_no,supplier_lot_no,origin_type,mfg_date,expiry_date,qc_status) VALUES
+ ('lot-water-1','itm-water','WATER-2609-01',NULL,'opening','2026-09-01',NULL,'released'),
+ ('lot-ipa-2','itm-solvent','IPA-2609-02','SV-4411','purchase','2026-09-10','2027-09-10','released');
+INSERT INTO stock (id,lot_id,bin_id,uom_id,qty_on_hand,qty_reserved) VALUES
+ ('stk-w1','lot-water-1','bin-a2','uom-l',5000,0),
+ ('stk-i2','lot-ipa-2','bin-f1','uom-l',400,0);
+
 -- ---------- QC specifications (Phase 2) ----------
 INSERT INTO specification (id,item_id,version,status,effective_date,approved_by) VALUES
  ('spec-caustic','itm-caustic',1,'approved','2026-01-01','usr-qc'),
@@ -128,3 +139,8 @@ INSERT INTO formula_step (id,formula_id,step_no,instruction,param_type,target,to
 
 INSERT INTO packaging_spec (id,formula_id,packaging_item_id,qty_per_base,uom_id) VALUES
  ('pk-1','fm-cleaner','itm-drum200',5,'uom-ea');
+
+-- ---------- Production (Phase 4): equipment ----------
+INSERT INTO equipment (id,code,name,equip_type,capacity_qty,capacity_uom_id,status) VALUES
+ ('eq-r1','RX-01','Reactor 1 (SS 2 kL)','reactor',2000,'uom-l','available'),
+ ('eq-r2','RX-02','Reactor 2 (SS 1 kL)','reactor',1000,'uom-l','available');
