@@ -1,5 +1,6 @@
 -- Sample data so the dashboard opens in a realistic state. Example data only.
 
+DELETE FROM mps_order;
 DELETE FROM batch_cost; DELETE FROM deviation; DELETE FROM batch_output; DELETE FROM batch_material;
 DELETE FROM batch_step; DELETE FROM batch; DELETE FROM work_order; DELETE FROM equipment;
 DELETE FROM packaging_spec; DELETE FROM formula_step; DELETE FROM formula_ingredient; DELETE FROM formula;
@@ -144,3 +145,7 @@ INSERT INTO packaging_spec (id,formula_id,packaging_item_id,qty_per_base,uom_id)
 INSERT INTO equipment (id,code,name,equip_type,capacity_qty,capacity_uom_id,status) VALUES
  ('eq-r1','RX-01','Reactor 1 (SS 2 kL)','reactor',2000,'uom-l','available'),
  ('eq-r2','RX-02','Reactor 2 (SS 1 kL)','reactor',1000,'uom-l','available');
+
+-- ---------- Planning (Phase 5): a demand line on the schedule ----------
+INSERT INTO mps_order (id,product_item_id,qty,uom_id,due_date,source,status) VALUES
+ ('mps-1','itm-cleaner',800,'uom-l','2026-10-05','manual','planned');

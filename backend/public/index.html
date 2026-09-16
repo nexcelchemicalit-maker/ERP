@@ -77,6 +77,7 @@
     <button data-tab="stock" class="active">Stock on hand</button>
     <button data-tab="lots">Lots</button>
     <button data-tab="formulas">Formulas</button>
+    <button data-tab="planning">Planning</button>
     <button data-tab="production">Production</button>
     <button data-tab="qc">Quality (QC)</button>
     <button data-tab="specs">Specifications</button>
@@ -97,6 +98,26 @@
   <section class="panel" id="panel-formulas">
     <div class="card"><h2>Formulas (Master Batch Records)</h2><div class="tblwrap"><table id="tbl-formulas"></table></div></div>
     <div class="card" id="formula-detail" hidden></div>
+  </section>
+
+  <section class="panel" id="panel-planning">
+    <div class="card">
+      <h2>Add to master schedule</h2>
+      <form class="grid" id="form-mps">
+        <label>Finished product
+          <select name="product_item_id" id="mps-item" required></select>
+        </label>
+        <label>Quantity (L)
+          <input name="qty" type="number" step="any" min="0" required placeholder="e.g. 800" />
+        </label>
+        <label>Due date
+          <input name="due_date" type="date" />
+        </label>
+      </form>
+      <div class="actions"><button class="go" id="mps-go">Add MPS order</button><span class="msg" id="mps-msg"></span></div>
+    </div>
+    <div class="card"><h2>Master production schedule</h2><div class="tblwrap"><table id="tbl-mps"></table></div></div>
+    <div class="card" id="mps-detail" hidden></div>
   </section>
 
   <section class="panel" id="panel-production">
@@ -329,6 +350,34 @@ async function openFormula(id){
   $('#formula-detail').scrollIntoView({behavior:'smooth', block:'nearest'});
 }
 
+// ---------- Planning ----------
+async function loadPlanning(){
+  const [items, mps] = await Promise.all([api('/items'), api('/mps-orders')]);
+  const finished = items.filter(i=>i.item_type==='finished');
+  $('#mps-item').innerHTML = finished.map(i=>`<option value="${i.id}">${esc(i.name)}</option>`).join('') || '<option value="">No finished products</option>';
+  table($('#tbl-mps'), [
+    {key:'due_date', label:'Due'},
+    {key:'product_name', label:'Product'},
+    {key:'qty', label:'Qty', num:true, render:(v,r)=>esc(v)+' '+esc(r.uom)},
+    {key:'source', label:'Source'},
+    {key:'status', label:'Status', render:pill},
+  ], mps, r => r.status==='converted'
+      ? '<span class="muted">→ WO</span>'
+      : `<button class="mini" data-req="${r.id}">Requirements</button> <button class="mini" data-convert="${r.id}">Convert to WO</button>`);
+}
+
+async function openRequirements(id){
+  const r = await api(`/mps-orders/${id}/requirements`);
+  if(!r.has_formula){ $('#mps-detail').hidden=false; $('#mps-detail').innerHTML='<h2>Requirements</h2><div style="padding:16px" class="muted">No approved formula for this product.</div>'; return; }
+  const rows = r.lines.map(l=>`<tr><td>${esc(l.item_name)}</td><td class="num">${esc(l.required.toFixed(2))} ${esc(l.uom)}</td><td class="num">${esc(l.available.toFixed(2))}</td><td class="num">${l.shortfall>0?('<span style="color:var(--danger)">'+l.shortfall.toFixed(2)+'</span>'):'0'}</td></tr>`).join('');
+  const verdict = r.can_build ? pill('released').replace('released','can build now') : pill('rejected').replace('rejected','shortfall — purchase needed');
+  $('#mps-detail').hidden = false;
+  $('#mps-detail').innerHTML = `<h2>Material requirements ${verdict}</h2>
+    <div style="padding:0 16px 6px" class="muted">Scale ×${r.scale_factor} · net of QC-released stock</div>
+    <div class="tblwrap"><table><thead><tr><th>Ingredient</th><th class="num">Required</th><th class="num">Available</th><th class="num">Shortfall</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  $('#mps-detail').scrollIntoView({behavior:'smooth', block:'nearest'});
+}
+
 // ---------- Production ----------
 let _lotsCache = [];
 let _openBatchId = null;
@@ -515,7 +564,7 @@ async function openCoa(id){
 }
 
 // Tabs
-const loaders = { stock: loadStock, lots: loadLots, formulas: loadFormulas, production: loadProduction, qc: loadQc, specs: loadSpecs, coas: loadCoas, movements: loadMoves, items: loadItems, receive: loadReceiveForm };
+const loaders = { stock: loadStock, lots: loadLots, formulas: loadFormulas, planning: loadPlanning, production: loadProduction, qc: loadQc, specs: loadSpecs, coas: loadCoas, movements: loadMoves, items: loadItems, receive: loadReceiveForm };
 $('#tabs').addEventListener('click', e => {
   const b = e.target.closest('button[data-tab]'); if(!b) return;
   document.querySelectorAll('#tabs button').forEach(x=>x.classList.toggle('active', x===b));
@@ -574,6 +623,23 @@ $('#sample-detail').addEventListener('click', e => {
   else if(e.target.id==='disp-release') dispose(sid,'released').catch(err=>alert(err.message));
   else if(e.target.id==='disp-reject') dispose(sid,'rejected').catch(err=>alert(err.message));
   else if(e.target.dataset.coa) openCoa(e.target.dataset.coa).catch(err=>alert(err.message));
+});
+
+// Planning: create MPS order
+$('#mps-go').addEventListener('click', async () => {
+  const msg=$('#mps-msg'); msg.className='msg';
+  const d = Object.fromEntries(new FormData($('#form-mps')).entries());
+  if(!d.product_item_id || !d.qty){ msg.textContent='Pick a product and qty.'; msg.className='msg err'; return; }
+  d.qty=Number(d.qty); if(!d.due_date) delete d.due_date;
+  try { await api('/mps-orders',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(d)}); msg.textContent='Added to schedule.'; msg.className='msg ok'; await loadPlanning(); }
+  catch(err){ msg.textContent=err.message; msg.className='msg err'; }
+});
+// Planning: requirements + convert
+$('#tbl-mps').addEventListener('click', async e => {
+  if(e.target.dataset.req){ openRequirements(e.target.dataset.req).catch(err=>alert(err.message)); return; }
+  const cid=e.target.dataset.convert; if(!cid) return;
+  try { const r=await api(`/mps-orders/${cid}/convert`,{method:'POST'}); await loadPlanning(); await loadTiles(); alert('Work order created — see Production tab.'); }
+  catch(err){ alert(err.message); }
 });
 
 // Production: create work order

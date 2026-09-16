@@ -957,6 +957,79 @@ app.post('/api/batches/:id/close', async (c) => {
   return c.json({ id, status: 'closed' });
 });
 
+// ================= Phase 5: Planning / MPS =================
+
+app.get('/api/mps-orders', async (c) => {
+  const rows = await c.env.DB.prepare(
+    `SELECT m.id, m.qty, m.due_date, m.source, m.status, u.code uom, i.name product_name, i.id product_item_id,
+            m.work_order_id
+     FROM mps_order m JOIN item i ON i.id=m.product_item_id JOIN uom u ON u.id=m.uom_id
+     ORDER BY m.due_date, m.created_at`,
+  ).all();
+  return c.json(rows.results);
+});
+
+app.post('/api/mps-orders', async (c) => {
+  const b = await c.req.json();
+  const db = c.env.DB;
+  if (!b.product_item_id || !b.qty) return c.json({ error: 'product_item_id and qty are required' }, 400);
+  let uomId = b.uom_id;
+  if (!uomId) uomId = (await db.prepare(`SELECT base_uom_id id FROM item WHERE id=?`).bind(b.product_item_id).first<{ id: string }>())?.id;
+  if (!uomId) return c.json({ error: 'item not found' }, 404);
+  const id = uid();
+  await db.prepare(`INSERT INTO mps_order (id,product_item_id,qty,uom_id,due_date,source,notes) VALUES (?,?,?,?,?,?,?)`)
+    .bind(id, b.product_item_id, b.qty, uomId, b.due_date ?? null, b.source ?? 'manual', b.notes ?? null)
+    .run();
+  return c.json({ id }, 201);
+});
+
+// Explode the approved formula and net against QC-released stock (MRP-lite)
+app.get('/api/mps-orders/:id/requirements', async (c) => {
+  const id = c.req.param('id');
+  const db = c.env.DB;
+  const m = await db.prepare(`SELECT product_item_id, qty FROM mps_order WHERE id=?`).bind(id).first<{ product_item_id: string; qty: number }>();
+  if (!m) return c.json({ error: 'mps order not found' }, 404);
+  const f = await db.prepare(`SELECT id, base_qty FROM formula WHERE product_item_id=? AND status='approved' ORDER BY version DESC LIMIT 1`).bind(m.product_item_id).first<{ id: string; base_qty: number }>();
+  if (!f) return c.json({ error: 'no approved formula for this product', has_formula: false }, 200);
+  const scale = m.qty / f.base_qty;
+  const ings = (await db
+    .prepare(`SELECT fi.item_id, fi.qty, u.code uom, i.code item_code, i.name item_name FROM formula_ingredient fi JOIN item i ON i.id=fi.item_id JOIN uom u ON u.id=fi.uom_id WHERE fi.formula_id=? ORDER BY fi.sequence`)
+    .bind(f.id)
+    .all()).results as Array<any>;
+  const lines = [];
+  let canBuild = true;
+  for (const ing of ings) {
+    const required = ing.qty * scale;
+    const avail = (await db
+      .prepare(`SELECT COALESCE(SUM(s.qty_on_hand-s.qty_reserved),0) a FROM stock s JOIN lot l ON l.id=s.lot_id WHERE l.item_id=? AND l.qc_status='released'`)
+      .bind(ing.item_id)
+      .first<{ a: number }>())?.a ?? 0;
+    const shortfall = Math.max(0, required - avail);
+    if (shortfall > 0) canBuild = false;
+    lines.push({ item_code: ing.item_code, item_name: ing.item_name, uom: ing.uom, required, available: avail, shortfall });
+  }
+  return c.json({ has_formula: true, scale_factor: scale, can_build: canBuild, lines });
+});
+
+// Convert an MPS order into a production work order
+app.post('/api/mps-orders/:id/convert', async (c) => {
+  const id = c.req.param('id');
+  const db = c.env.DB;
+  const m = await db.prepare(`SELECT product_item_id, qty, status FROM mps_order WHERE id=?`).bind(id).first<{ product_item_id: string; qty: number; status: string }>();
+  if (!m) return c.json({ error: 'mps order not found' }, 404);
+  if (m.status === 'converted') return c.json({ error: 'already converted' }, 400);
+  const f = await db.prepare(`SELECT id, base_qty FROM formula WHERE product_item_id=? AND status='approved' ORDER BY version DESC LIMIT 1`).bind(m.product_item_id).first<{ id: string; base_qty: number }>();
+  if (!f) return c.json({ error: 'no approved formula for this product' }, 400);
+  const woId = uid();
+  const scale = m.qty / f.base_qty;
+  const uomId = (await db.prepare(`SELECT base_uom_id id FROM formula WHERE id=?`).bind(f.id).first<{ id: string }>())?.id;
+  await db.batch([
+    db.prepare(`INSERT INTO work_order (id,formula_id,product_item_id,planned_qty,uom_id,scale_factor,status,mps_order_ref) VALUES (?,?,?,?,?,?, 'planned', ?)`).bind(woId, f.id, m.product_item_id, m.qty, uomId, scale, id),
+    db.prepare(`UPDATE mps_order SET status='converted', work_order_id=? WHERE id=?`).bind(woId, id),
+  ]);
+  return c.json({ work_order_id: woId });
+});
+
 // API 404 fallback (static assets are handled by the [assets] binding).
 app.all('/api/*', (c) => c.json({ error: 'not found' }, 404));
 
