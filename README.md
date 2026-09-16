@@ -9,11 +9,22 @@ Compliance, Planning, Sales & Procurement, and Finance.
 
 See `docs/` for the process research, the full data model (ERD), and the phased roadmap.
 
-## Status — Phase 1: Foundations + Inventory
+## Status — Phases 1–4 complete
 
-Implemented: master data (items, UOMs, partners, warehouses/bins) and the inventory
-traceability spine (lots with QC status, stock by lot+bin+uom, movement ledger, goods receipt,
-transfers, adjustments, and lot release/reject).
+- **Phase 1 — Foundations + Inventory:** master data (items, UOMs, partners, warehouses/bins)
+  and the traceability spine (lots with QC status, stock by lot+bin+uom, movement ledger, goods
+  receipt, transfers, adjustments).
+- **Phase 2 — Quality Control:** versioned specs + parameters, sample lifecycle (pull → enter
+  results with automatic spec evaluation / OOS flag → disposition), lot release/reject, and
+  automatic COA generation.
+- **Phase 3 — R&D / Formulation:** versioned formulas (ingredients, process steps with IPC
+  checkpoints, packaging) with separated material vs packaging costing, and approval.
+- **Phase 4 — Production:** work orders from an approved formula (scale factor), batch (BMR)
+  execution — dispense released lots, run steps (IPC auto-pulls an in-process QC sample and holds
+  the batch), book outputs with lot genealogy, and roll up actual-vs-standard cost; review-lock close.
+
+The full chain works end-to-end: receive → QC release → formula → work order → batch → dispense
+→ IPC sample → output lot (quarantine) → finished QC → COA, all traceable via lot genealogy.
 
 ## Quick start (local, no Cloudflare account needed)
 
